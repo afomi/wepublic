@@ -23,6 +23,13 @@ end
 config :wepublic, WepublicWeb.Endpoint,
   http: [port: String.to_integer(System.get_env("PORT", "4000"))]
 
+# Configure GitHub OAuth (required for all environments)
+if System.get_env("GITHUB_CLIENT_ID") do
+  config :ueberauth, Ueberauth.Strategy.Github.OAuth,
+    client_id: System.get_env("GITHUB_CLIENT_ID"),
+    client_secret: System.get_env("GITHUB_CLIENT_SECRET")
+end
+
 if config_env() == :prod do
   database_url =
     System.get_env("DATABASE_URL") ||
@@ -100,21 +107,14 @@ if config_env() == :prod do
   #
   # Check `Plug.SSL` for all available options in `force_ssl`.
 
-  # ## Configuring the mailer
-  #
-  # In production you need to configure the mailer to use a different adapter.
-  # Here is an example configuration for Mailgun:
-  #
-  #     config :wepublic, Wepublic.Mailer,
-  #       adapter: Swoosh.Adapters.Mailgun,
-  #       api_key: System.get_env("MAILGUN_API_KEY"),
-  #       domain: System.get_env("MAILGUN_DOMAIN")
-  #
-  # Most non-SMTP adapters require an API client. Swoosh supports Req, Hackney,
-  # and Finch out-of-the-box. This configuration is typically done at
-  # compile-time in your config/prod.exs:
-  #
-  #     config :swoosh, :api_client, Swoosh.ApiClient.Req
-  #
-  # See https://hexdocs.pm/swoosh/Swoosh.html#module-installation for details.
+  # Configure AWS SES for email delivery
+  if System.get_env("AWS_ACCESS_KEY_ID") do
+    config :wepublic, Wepublic.Mailer,
+      adapter: Swoosh.Adapters.AmazonSES,
+      region: System.get_env("AWS_REGION") || "us-west-2",
+      access_key: System.get_env("AWS_ACCESS_KEY_ID"),
+      secret: System.get_env("AWS_SECRET_ACCESS_KEY")
+
+    config :swoosh, :api_client, Swoosh.ApiClient.Req
+  end
 end
