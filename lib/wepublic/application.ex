@@ -1,0 +1,34 @@
+defmodule Wepublic.Application do
+  # See https://hexdocs.pm/elixir/Application.html
+  # for more information on OTP Applications
+  @moduledoc false
+
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      WepublicWeb.Telemetry,
+      Wepublic.Repo,
+      {DNSCluster, query: Application.get_env(:wepublic, :dns_cluster_query) || :ignore},
+      {Phoenix.PubSub, name: Wepublic.PubSub},
+      # Start a worker by calling: Wepublic.Worker.start_link(arg)
+      # {Wepublic.Worker, arg},
+      # Start to serve requests, typically the last entry
+      WepublicWeb.Endpoint
+    ]
+
+    # See https://hexdocs.pm/elixir/Supervisor.html
+    # for other strategies and supported options
+    opts = [strategy: :one_for_one, name: Wepublic.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+
+  # Tell Phoenix to update the endpoint configuration
+  # whenever the application is updated.
+  @impl true
+  def config_change(changed, _new, removed) do
+    WepublicWeb.Endpoint.config_change(changed, removed)
+    :ok
+  end
+end
