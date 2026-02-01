@@ -356,4 +356,112 @@ defmodule Wepublic.Accounts do
 
     Repo.exists?(query)
   end
+
+  @doc """
+  Lists connections for a user with their online status.
+  Returns connections sorted with online users first.
+  """
+  def list_connections_with_presence(%User{} = user) do
+    connections = list_connections(user)
+    online_user_ids = get_online_user_ids()
+
+    connections
+    |> Enum.map(fn conn ->
+      # Get the other user in the connection
+      other_user =
+        if conn.user_id == user.id,
+          do: conn.connected_user,
+          else: conn.user
+
+      %{
+        user: other_user,
+        online: MapSet.member?(online_user_ids, other_user.id),
+        connected_at: conn.inserted_at
+      }
+    end)
+    |> Enum.sort_by(fn %{online: online} -> if online, do: 0, else: 1 end)
+  end
+
+  defp get_online_user_ids do
+    WepublicWeb.Presence.list_users("map")
+    |> Enum.map(fn meta ->
+      case meta.user_id do
+        "user_" <> id -> String.to_integer(id)
+        _ -> nil
+      end
+    end)
+    |> Enum.reject(&is_nil/1)
+    |> MapSet.new()
+  end
+
+  ## Verification
+
+  @doc """
+  Starts DID verification by setting the DID and generating a verification token.
+  """
+  def start_did_verification(%User{} = user, did) do
+    user
+    |> User.did_verification_changeset(%{did: did})
+    |> Repo.update()
+  end
+
+  @doc """
+  Updates the user's feed URL.
+  """
+  def update_feed_url(%User{} = user, feed_url) do
+    user
+    |> User.feed_changeset(%{feed_url: feed_url})
+    |> Repo.update()
+  end
+
+  @doc """
+  Marks onboarding as complete for the user.
+  """
+  def complete_onboarding(%User{} = user) do
+    user
+    |> User.onboarding_complete_changeset()
+    |> Repo.update()
+  end
+
+  @doc """
+  Gets all verified users with their verification data.
+  Used for displaying verification indicators on the map.
+  """
+  def list_verified_users do
+    from(u in User,
+      where: not is_nil(u.did_verified_at) or not is_nil(u.feed_verified_at),
+      select: %{
+        id: u.id,
+        display_name: u.display_name,
+        avatar_color: u.avatar_color,
+        did_verified: not is_nil(u.did_verified_at),
+        feed_verified: not is_nil(u.feed_verified_at),
+        has_products: false
+      }
+    )
+    |> Repo.all()
+  end
+
+  @doc """
+  Gets user data for presence/map display including verification status.
+  """
+  def get_user_map_data(%User{} = user) do
+    %{
+      id: user.id,
+      display_name: user.display_name || user.email |> String.split("@") |> hd(),
+      avatar_color: user.avatar_color || "#4a90d9",
+      verification_level: User.verification_level(user),
+      did_verified: User.did_verified?(user),
+      feed_verified: User.feed_verified?(user),
+      has_products: check_has_products(user)
+    }
+  end
+
+  defp check_has_products(%User{feed_verified_at: nil}), do: false
+
+  defp check_has_products(%User{} = _user) do
+    # Cache this check to avoid fetching feed on every request
+    # For now, return false - would be populated by a background job
+    false
+  end
 end

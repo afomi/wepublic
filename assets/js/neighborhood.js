@@ -11,11 +11,31 @@ import * as THREE from "three";
  * - Y axis: Altitude (positive = up)
  * - Z axis: North-South (positive = North)
  * - 1 unit = 1 meter
+ *
+ * Controls:
+ * - WASD / Arrow keys: Move the viewer
+ * - Click on ground: Move to that location
+ * - Click on user: Select/interact with user
+ *
+ * User indicators:
+ * - Verification halo: glowing ring for verified users (DID and/or feed)
+ * - Seller badge: floating icon above users with items for sale
+ * - Connection visibility: connected users are solid, others translucent
+ * - Viewer highlight: pulsing outline around your avatar
  */
 
-export function renderNeighborhood(containerId) {
+export function renderNeighborhood(containerId, options = {}) {
   const container = document.getElementById(containerId);
   if (!container) return null;
+
+  // Configuration with defaults
+  const config = {
+    users: options.users || [],
+    currentUserId: options.currentUserId || null,
+    connections: options.connections || [],
+    onUserClick: options.onUserClick || null,
+    ...options
+  };
 
   // World origin (Vacaville, CA)
   const origin = { lat: 38.3566, long: -121.9877 };
@@ -40,7 +60,6 @@ export function renderNeighborhood(containerId) {
   );
 
   // Classic isometric angle
-  // Position camera at equal distances on X, Y, Z
   const camDistance = 100;
   camera.position.set(camDistance, camDistance, camDistance);
   camera.lookAt(0, 0, 0);
@@ -52,6 +71,10 @@ export function renderNeighborhood(containerId) {
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   container.appendChild(renderer.domElement);
+
+  // Canvas styling
+  renderer.domElement.style.outline = "none";
+  renderer.domElement.style.cursor = "pointer";
 
   // Lighting
   const ambientLight = new THREE.AmbientLight(0x404060, 0.6);
@@ -79,6 +102,7 @@ export function renderNeighborhood(containerId) {
   const ground = new THREE.Mesh(groundGeometry, groundMaterial);
   ground.rotation.x = -Math.PI / 2;
   ground.receiveShadow = true;
+  ground.userData.isGround = true;
   scene.add(ground);
 
   // Seeded random for consistent generation
@@ -94,10 +118,10 @@ export function renderNeighborhood(containerId) {
   }
 
   // Street creation
-  function createStreet(x, z, width, length, vertical = false) {
+  function createStreet(x, z, streetWidth, length, vertical = false) {
     const streetGeometry = new THREE.PlaneGeometry(
-      vertical ? width : length,
-      vertical ? length : width
+      vertical ? streetWidth : length,
+      vertical ? length : streetWidth
     );
     const streetMaterial = new THREE.MeshStandardMaterial({
       color: 0x444444,
@@ -107,6 +131,7 @@ export function renderNeighborhood(containerId) {
     street.rotation.x = -Math.PI / 2;
     street.position.set(x, 0.01, z);
     street.receiveShadow = true;
+    street.userData.isGround = true;
     return street;
   }
 
@@ -134,6 +159,7 @@ export function renderNeighborhood(containerId) {
     building.position.set(x, h / 2, z);
     building.castShadow = true;
     building.receiveShadow = true;
+    building.userData.isBuilding = true;
     return building;
   }
 
@@ -162,56 +188,215 @@ export function renderNeighborhood(containerId) {
   seedBlock(-blockSize / 2, blockSize, 1003);
   seedBlock(blockSize / 2, blockSize, 1004);
 
-  // User/Figure data
-  const users = [
+  // Default users for development/demo
+  const defaultUsers = [
     {
       id: "viewer",
       name: "You",
       website: "https://yoursite.example",
-      position: { x: -5, z: 0 },
-      color: 0x4a90d9,
+      position: { x: 0, z: 0 },
+      color: "#4a90d9",
       connections: ["alice"],
-      isViewer: true
+      isViewer: true,
+      verificationLevel: 0,
+      hasProducts: false
     },
     {
       id: "alice",
       name: "Alice",
       website: "https://alice.example.com",
-      position: { x: 5, z: 3 },
-      color: 0xd94a8a,
-      connections: ["viewer"]
+      position: { x: 8, z: 5 },
+      color: "#d94a8a",
+      connections: ["viewer"],
+      verificationLevel: 2,
+      hasProducts: true
     },
     {
       id: "bob",
       name: "Bob",
       website: "https://bob.example.com",
-      position: { x: 15, z: -5 },
-      color: 0x8ad94a,
-      connections: []
+      position: { x: 15, z: -8 },
+      color: "#8ad94a",
+      connections: [],
+      verificationLevel: 1,
+      hasProducts: false
     },
     {
       id: "carol",
       name: "Carol",
       website: "https://carol.example.com",
-      position: { x: -12, z: 8 },
-      color: 0xd9a84a,
-      connections: []
+      position: { x: -12, z: 10 },
+      color: "#d9a84a",
+      connections: [],
+      verificationLevel: 0,
+      hasProducts: false
     }
   ];
 
+  const users = config.users.length > 0 ? config.users : defaultUsers;
+  const viewer = users.find(u => u.isViewer) || users[0];
+
   // Determine visibility/opacity based on connections
-  function getOpacity(viewer, subject) {
+  function getOpacity(viewerUser, subject) {
+    if (!viewerUser) return 0.6;
     if (subject.isViewer) return 1.0;
-    if (viewer.connections.includes(subject.id)) return 1.0;
+    if (subject.id === config.currentUserId) return 1.0;
+    if (viewerUser.connections && viewerUser.connections.includes(subject.id)) return 1.0;
+    if (config.connections.includes(subject.id)) return 1.0;
     return 0.4; // Public but not connected
+  }
+
+  // Color conversion helper
+  function parseColor(color) {
+    if (typeof color === "number") return color;
+    if (typeof color === "string" && color.startsWith("#")) {
+      return parseInt(color.slice(1), 16);
+    }
+    return 0x4a90d9; // default blue
+  }
+
+  // Create verification halo (glowing ring)
+  function createVerificationHalo(verificationLevel) {
+    if (verificationLevel === 0) return null;
+
+    const group = new THREE.Group();
+
+    // Ring geometry
+    const innerRadius = 0.5;
+    const outerRadius = 0.65;
+    const ringGeometry = new THREE.RingGeometry(innerRadius, outerRadius, 32);
+
+    // Color based on verification level
+    const haloColor = verificationLevel === 2 ? 0x00ff88 : 0x00aaff;
+
+    const ringMaterial = new THREE.MeshBasicMaterial({
+      color: haloColor,
+      transparent: true,
+      opacity: 0.7,
+      side: THREE.DoubleSide
+    });
+
+    const ring = new THREE.Mesh(ringGeometry, ringMaterial);
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.y = 2.3;
+    group.add(ring);
+
+    // Add second ring for level 2
+    if (verificationLevel === 2) {
+      const outerRingGeometry = new THREE.RingGeometry(0.7, 0.8, 32);
+      const outerRing = new THREE.Mesh(outerRingGeometry, ringMaterial.clone());
+      outerRing.rotation.x = -Math.PI / 2;
+      outerRing.position.y = 2.3;
+      group.add(outerRing);
+    }
+
+    return group;
+  }
+
+  // Create seller badge (floating icon)
+  function createSellerBadge() {
+    const group = new THREE.Group();
+
+    // Simple diamond/tag shape
+    const badgeGeometry = new THREE.OctahedronGeometry(0.2, 0);
+    const badgeMaterial = new THREE.MeshBasicMaterial({
+      color: 0xffd700, // Gold
+      transparent: true,
+      opacity: 0.9
+    });
+
+    const badge = new THREE.Mesh(badgeGeometry, badgeMaterial);
+    badge.position.y = 2.8;
+    badge.rotation.x = Math.PI / 4;
+    group.add(badge);
+
+    return group;
+  }
+
+  // Create viewer highlight (pulsing circle under feet)
+  function createViewerHighlight() {
+    const group = new THREE.Group();
+
+    // Outer ring
+    const ringGeometry = new THREE.RingGeometry(0.6, 0.8, 32);
+    const ringMaterial = new THREE.MeshBasicMaterial({
+      color: 0x00ffff,
+      transparent: true,
+      opacity: 0.8,
+      side: THREE.DoubleSide
+    });
+
+    const ring = new THREE.Mesh(ringGeometry, ringMaterial);
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.y = 0.02;
+    group.add(ring);
+
+    // Inner glow
+    const glowGeometry = new THREE.CircleGeometry(0.5, 32);
+    const glowMaterial = new THREE.MeshBasicMaterial({
+      color: 0x00ffff,
+      transparent: true,
+      opacity: 0.3,
+      side: THREE.DoubleSide
+    });
+
+    const glow = new THREE.Mesh(glowGeometry, glowMaterial);
+    glow.rotation.x = -Math.PI / 2;
+    glow.position.y = 0.01;
+    group.add(glow);
+
+    // Direction indicator (arrow pointing forward)
+    const arrowShape = new THREE.Shape();
+    arrowShape.moveTo(0, 0.4);
+    arrowShape.lineTo(-0.15, 0.15);
+    arrowShape.lineTo(0.15, 0.15);
+    arrowShape.closePath();
+
+    const arrowGeometry = new THREE.ShapeGeometry(arrowShape);
+    const arrowMaterial = new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.9,
+      side: THREE.DoubleSide
+    });
+
+    const arrow = new THREE.Mesh(arrowGeometry, arrowMaterial);
+    arrow.rotation.x = -Math.PI / 2;
+    arrow.position.y = 0.03;
+    arrow.position.z = -0.3;
+    group.add(arrow);
+
+    return group;
+  }
+
+  // Create movement target indicator
+  function createTargetIndicator() {
+    const group = new THREE.Group();
+
+    const ringGeometry = new THREE.RingGeometry(0.3, 0.4, 32);
+    const ringMaterial = new THREE.MeshBasicMaterial({
+      color: 0xffff00,
+      transparent: true,
+      opacity: 0.8,
+      side: THREE.DoubleSide
+    });
+
+    const ring = new THREE.Mesh(ringGeometry, ringMaterial);
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.y = 0.02;
+    group.add(ring);
+
+    group.visible = false;
+    return group;
   }
 
   // Create figure (simple human shape)
   function createFigure(user, opacity) {
     const group = new THREE.Group();
+    const color = parseColor(user.color);
 
     const bodyMaterial = new THREE.MeshStandardMaterial({
-      color: user.color,
+      color: color,
       transparent: opacity < 1,
       opacity: opacity,
       roughness: 0.6
@@ -243,70 +428,248 @@ export function renderNeighborhood(containerId) {
     rightLeg.castShadow = true;
     group.add(rightLeg);
 
-    group.position.set(user.position.x, 0, user.position.z);
-    group.userData = { user: user, opacity: opacity };
+    // Add verification halo if verified
+    const verificationLevel = user.verificationLevel || 0;
+    const halo = createVerificationHalo(verificationLevel);
+    if (halo) {
+      group.add(halo);
+      group.userData.halo = halo;
+    }
+
+    // Add seller badge if has products
+    if (user.hasProducts) {
+      const badge = createSellerBadge();
+      group.add(badge);
+      group.userData.sellerBadge = badge;
+    }
+
+    // Add viewer highlight if this is the viewer
+    if (user.isViewer) {
+      const highlight = createViewerHighlight();
+      group.add(highlight);
+      group.userData.viewerHighlight = highlight;
+    }
+
+    // Position
+    const pos = user.position || { x: random() * 20 - 10, z: random() * 20 - 10 };
+    group.position.set(pos.x, 0, pos.z);
+    group.userData = {
+      ...group.userData,
+      user: user,
+      opacity: opacity,
+      basePosition: { x: pos.x, z: pos.z },
+      isViewer: user.isViewer || false
+    };
 
     return group;
   }
 
   // Create all figures
-  const viewer = users.find(u => u.isViewer);
   const figures = [];
+  let viewerFigure = null;
 
-  users.forEach(user => {
+  console.log("[Neighborhood] Creating figures for", users.length, "users");
+
+  users.forEach((user) => {
     const opacity = getOpacity(viewer, user);
     const figure = createFigure(user, opacity);
     figures.push(figure);
     scene.add(figure);
+
+    if (user.isViewer) {
+      viewerFigure = figure;
+      console.log("[Neighborhood] Viewer figure created:", user.name, "at", user.position);
+    }
   });
 
+  if (!viewerFigure) {
+    console.warn("[Neighborhood] No viewer figure found! Users:", users.map(u => ({ id: u.id, isViewer: u.isViewer })));
+  }
+
+  // Create target indicator
+  const targetIndicator = createTargetIndicator();
+  scene.add(targetIndicator);
+
+  // Movement state
+  const movement = {
+    target: null,
+    speed: 8, // meters per second
+    keys: {
+      up: false,
+      down: false,
+      left: false,
+      right: false
+    }
+  };
+
   // Update info panel
-  const figureListEl = document.getElementById("figure-list");
-  if (figureListEl) {
+  function updateInfoPanel() {
+    const figureListEl = document.getElementById("figure-list");
+    if (!figureListEl) return;
+
     figureListEl.innerHTML = "";
     users.forEach(user => {
       const opacity = getOpacity(viewer, user);
       const connected = opacity === 1.0;
+      const colorHex = typeof user.color === "string"
+        ? user.color
+        : "#" + parseColor(user.color).toString(16).padStart(6, "0");
+
       const div = document.createElement("div");
       div.style.cssText = `
         padding: 6px 0;
         border-bottom: 1px solid #333;
         opacity: ${opacity};
+        cursor: pointer;
       `;
+
+      let badges = "";
+      if (user.verificationLevel === 2) {
+        badges += '<span style="color: #0f8; font-size: 10px; margin-left: 4px;">✓✓</span>';
+      } else if (user.verificationLevel === 1) {
+        badges += '<span style="color: #0af; font-size: 10px; margin-left: 4px;">✓</span>';
+      }
+      if (user.hasProducts) {
+        badges += '<span style="color: #fd0; font-size: 10px; margin-left: 4px;">💰</span>';
+      }
+
       div.innerHTML = `
         <div style="display: flex; align-items: center; gap: 8px;">
-          <div style="width: 10px; height: 10px; border-radius: 50%; background: #${user.color.toString(16).padStart(6, '0')};"></div>
-          <span>${user.name}</span>
+          <div style="width: 10px; height: 10px; border-radius: 50%; background: ${colorHex};"></div>
+          <span>${user.name || user.display_name || "Anonymous"}</span>
+          ${badges}
           ${connected && !user.isViewer ? '<span style="color: #4a4; font-size: 10px;">connected</span>' : ''}
-          ${user.isViewer ? '<span style="color: #888; font-size: 10px;">you</span>' : ''}
+          ${user.isViewer ? '<span style="color: #0ff; font-size: 10px;">you</span>' : ''}
         </div>
         <div style="font-size: 10px; color: #666; margin-top: 2px; margin-left: 18px;">
-          ${user.website}
+          ${user.website || user.did || ""}
         </div>
       `;
+
+      // Click handler
+      if (config.onUserClick && !user.isViewer) {
+        div.onclick = () => config.onUserClick(user);
+      }
+
       figureListEl.appendChild(div);
     });
+
+    // Add controls hint
+    const hint = document.createElement("div");
+    hint.style.cssText = "margin-top: 8px; padding-top: 8px; border-top: 1px solid #444; color: #666; font-size: 9px;";
+    hint.innerHTML = "WASD/Arrows: Move • Click: Go to";
+    figureListEl.appendChild(hint);
   }
+
+  updateInfoPanel();
 
   // Animation state
   let time = 0;
   let animationId = null;
-  const walkPaths = users.map((user, i) => ({
-    baseX: user.position.x,
-    baseZ: user.position.z,
-    speed: 0.3 + (i * 0.1),
-    radius: 2 + (i * 0.5),
-    offset: i * Math.PI / 2
-  }));
+  let lastTime = performance.now();
+
+  // Create walk paths for NPCs only
+  const walkPaths = figures.map((figure, i) => {
+    if (figure.userData.isViewer) {
+      return null; // Viewer doesn't auto-walk
+    }
+    return {
+      baseX: figure.userData.basePosition?.x || 0,
+      baseZ: figure.userData.basePosition?.z || 0,
+      speed: 0.2 + (i * 0.05),
+      radius: 1.5 + (i * 0.3),
+      offset: i * Math.PI / 3
+    };
+  });
 
   function animate() {
     animationId = requestAnimationFrame(animate);
 
-    time += 0.016; // ~60fps
+    const now = performance.now();
+    const delta = (now - lastTime) / 1000; // seconds
+    lastTime = now;
 
-    // Animate figures walking
+    time += delta;
+
+    // Handle viewer movement
+    if (viewerFigure) {
+      let dx = 0;
+      let dz = 0;
+
+      // Keyboard movement (isometric adjusted)
+      if (movement.keys.up) { dx -= 1; dz -= 1; }
+      if (movement.keys.down) { dx += 1; dz += 1; }
+      if (movement.keys.left) { dx -= 1; dz += 1; }
+      if (movement.keys.right) { dx += 1; dz -= 1; }
+
+      // Normalize diagonal movement
+      if (dx !== 0 || dz !== 0) {
+        const len = Math.sqrt(dx * dx + dz * dz);
+        dx = (dx / len) * movement.speed * delta;
+        dz = (dz / len) * movement.speed * delta;
+
+        viewerFigure.position.x += dx;
+        viewerFigure.position.z += dz;
+
+        // Face movement direction
+        viewerFigure.rotation.y = Math.atan2(dx, dz);
+
+        // Cancel click-to-move target
+        movement.target = null;
+        targetIndicator.visible = false;
+      }
+
+      // Click-to-move
+      if (movement.target) {
+        const tx = movement.target.x - viewerFigure.position.x;
+        const tz = movement.target.z - viewerFigure.position.z;
+        const dist = Math.sqrt(tx * tx + tz * tz);
+
+        if (dist < 0.5) {
+          // Arrived
+          movement.target = null;
+          targetIndicator.visible = false;
+        } else {
+          // Move towards target
+          const moveSpeed = movement.speed * delta;
+          const moveRatio = Math.min(moveSpeed / dist, 1);
+
+          viewerFigure.position.x += tx * moveRatio;
+          viewerFigure.position.z += tz * moveRatio;
+
+          // Face movement direction
+          viewerFigure.rotation.y = Math.atan2(tx, tz);
+        }
+      }
+
+      // Animate viewer highlight pulse
+      if (viewerFigure.userData.viewerHighlight) {
+        const pulse = 0.7 + Math.sin(time * 3) * 0.3;
+        viewerFigure.userData.viewerHighlight.children.forEach(child => {
+          if (child.material) {
+            child.material.opacity = child.userData?.baseOpacity
+              ? child.userData.baseOpacity * pulse
+              : pulse * 0.5;
+          }
+        });
+      }
+
+      // Walking animation for viewer
+      const isMoving = (dx !== 0 || dz !== 0) || movement.target;
+      if (isMoving) {
+        viewerFigure.position.y = Math.abs(Math.sin(time * 8)) * 0.08;
+      } else {
+        viewerFigure.position.y = 0;
+      }
+    }
+
+    // Animate NPC figures
     figures.forEach((figure, i) => {
+      if (figure.userData.isViewer) return;
+
       const path = walkPaths[i];
+      if (!path) return;
+
       const walkCycle = time * path.speed + path.offset;
 
       // Simple circular path
@@ -318,7 +681,25 @@ export function renderNeighborhood(containerId) {
 
       // Subtle bobbing
       figure.position.y = Math.abs(Math.sin(walkCycle * 4)) * 0.05;
+
+      // Animate halo rotation
+      if (figure.userData.halo) {
+        figure.userData.halo.rotation.y = time * 0.5;
+      }
+
+      // Animate seller badge bobbing
+      if (figure.userData.sellerBadge) {
+        figure.userData.sellerBadge.position.y = 2.8 + Math.sin(time * 2) * 0.1;
+        figure.userData.sellerBadge.rotation.y = time;
+      }
     });
+
+    // Animate target indicator
+    if (targetIndicator.visible) {
+      targetIndicator.rotation.y = time * 2;
+      const scale = 1 + Math.sin(time * 4) * 0.2;
+      targetIndicator.scale.set(scale, 1, scale);
+    }
 
     renderer.render(scene, camera);
   }
@@ -342,16 +723,138 @@ export function renderNeighborhood(containerId) {
 
   window.addEventListener("resize", onWindowResize);
 
-  // Return cleanup function for LiveView hook integration
-  return function cleanup() {
-    window.removeEventListener("resize", onWindowResize);
-    if (animationId) {
-      cancelAnimationFrame(animationId);
+  // Keyboard controls - attach to document for reliable capture
+  function onKeyDown(event) {
+    // Only handle if not typing in an input
+    if (event.target.tagName === "INPUT" || event.target.tagName === "TEXTAREA") {
+      return;
     }
-    renderer.dispose();
-    scene.clear();
-    if (container.contains(renderer.domElement)) {
-      container.removeChild(renderer.domElement);
+
+    let handled = false;
+    switch (event.code) {
+      case "KeyW":
+      case "ArrowUp":
+        movement.keys.up = true;
+        handled = true;
+        break;
+      case "KeyS":
+      case "ArrowDown":
+        movement.keys.down = true;
+        handled = true;
+        break;
+      case "KeyA":
+      case "ArrowLeft":
+        movement.keys.left = true;
+        handled = true;
+        break;
+      case "KeyD":
+      case "ArrowRight":
+        movement.keys.right = true;
+        handled = true;
+        break;
     }
+
+    if (handled) {
+      console.log("[Neighborhood] Key pressed:", event.code, "viewerFigure:", !!viewerFigure);
+      event.preventDefault();
+      event.stopPropagation();
+    }
+  }
+
+  function onKeyUp(event) {
+    switch (event.code) {
+      case "KeyW":
+      case "ArrowUp":
+        movement.keys.up = false;
+        break;
+      case "KeyS":
+      case "ArrowDown":
+        movement.keys.down = false;
+        break;
+      case "KeyA":
+      case "ArrowLeft":
+        movement.keys.left = false;
+        break;
+      case "KeyD":
+      case "ArrowRight":
+        movement.keys.right = false;
+        break;
+    }
+  }
+
+  // Attach to document with capture phase to get events first
+  document.addEventListener("keydown", onKeyDown, true);
+  document.addEventListener("keyup", onKeyUp, true);
+
+  // Raycasting for click detection
+  const raycaster = new THREE.Raycaster();
+  const mouse = new THREE.Vector2();
+
+  function onMouseClick(event) {
+    const rect = renderer.domElement.getBoundingClientRect();
+    mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+    raycaster.setFromCamera(mouse, camera);
+    const intersects = raycaster.intersectObjects(scene.children, true);
+
+    console.log("[Neighborhood] Click detected, intersects:", intersects.length, "viewerFigure:", !!viewerFigure);
+
+    for (const intersect of intersects) {
+      let obj = intersect.object;
+
+      // Check if clicked on ground for movement
+      while (obj) {
+        if (obj.userData.isGround) {
+          // Move to clicked position
+          const point = intersect.point;
+          console.log("[Neighborhood] Ground clicked at", point.x.toFixed(1), point.z.toFixed(1));
+          movement.target = { x: point.x, z: point.z };
+          targetIndicator.position.set(point.x, 0, point.z);
+          targetIndicator.visible = true;
+          return;
+        }
+
+        if (obj.userData.user) {
+          // Clicked on a user
+          console.log("[Neighborhood] User clicked:", obj.userData.user.name);
+          if (!obj.userData.user.isViewer && config.onUserClick) {
+            config.onUserClick(obj.userData.user);
+          }
+          return;
+        }
+
+        obj = obj.parent;
+      }
+    }
+  }
+
+  renderer.domElement.addEventListener("click", onMouseClick);
+
+
+  // Public API for updating users from LiveView
+  function updateUsers(newUsers) {
+    config.users = newUsers;
+    updateInfoPanel();
+  }
+
+  // Return cleanup function and API for LiveView hook integration
+  return {
+    cleanup: function() {
+      window.removeEventListener("resize", onWindowResize);
+      document.removeEventListener("keydown", onKeyDown, true);
+      document.removeEventListener("keyup", onKeyUp, true);
+      renderer.domElement.removeEventListener("click", onMouseClick);
+      if (animationId) {
+        cancelAnimationFrame(animationId);
+      }
+      renderer.dispose();
+      scene.clear();
+      if (container.contains(renderer.domElement)) {
+        container.removeChild(renderer.domElement);
+      }
+    },
+    updateUsers: updateUsers,
+    getViewerPosition: () => viewerFigure ? { x: viewerFigure.position.x, z: viewerFigure.position.z } : null
   };
 }

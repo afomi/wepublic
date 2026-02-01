@@ -29,7 +29,28 @@ import { renderNeighborhood } from "./neighborhood"
 // Neighborhood LiveView hook
 const Neighborhood = {
   mounted() {
-    this.cleanup = renderNeighborhood(this.el.id)
+    // Parse configuration from data attributes
+    const config = {
+      users: JSON.parse(this.el.dataset.users || "[]"),
+      currentUserId: this.el.dataset.currentUserId || null,
+      connections: JSON.parse(this.el.dataset.connections || "[]"),
+      onUserClick: (user) => {
+        this.pushEvent("user_clicked", { user_id: user.id })
+      }
+    }
+
+    const result = renderNeighborhood(this.el.id, config)
+    if (result) {
+      this.cleanup = result.cleanup
+      this.updateUsers = result.updateUsers
+    }
+
+    // Listen for user updates from server
+    this.handleEvent("update_users", ({ users }) => {
+      if (this.updateUsers) {
+        this.updateUsers(users)
+      }
+    })
   },
   destroyed() {
     if (this.cleanup) {
@@ -39,7 +60,7 @@ const Neighborhood = {
 }
 
 // Expose for non-LiveView usage
-window.neighborhood = () => renderNeighborhood("neighborhood-container")
+window.neighborhood = (options) => renderNeighborhood("neighborhood-container", options)
 
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
 const liveSocket = new LiveSocket("/live", Socket, {

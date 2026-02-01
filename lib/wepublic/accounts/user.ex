@@ -20,8 +20,24 @@ defmodule Wepublic.Accounts.User do
     field :github_username, :string
     field :github_avatar_url, :string
 
+    # DID verification
+    field :did_verified_at, :utc_datetime
+    field :did_verification_token, :string
+    field :did_document_url, :string
+
+    # Feed verification
+    field :feed_url, :string
+    field :feed_verified_at, :utc_datetime
+    field :feed_title, :string
+    field :feed_last_fetched_at, :utc_datetime
+
+    # Onboarding
+    field :onboarding_completed_at, :utc_datetime
+
     timestamps(type: :utc_datetime)
   end
+
+  @verification_token_length 32
 
   @doc """
   A user changeset for registering or changing the email.
@@ -172,5 +188,91 @@ defmodule Wepublic.Accounts.User do
   def valid_password?(_, _) do
     Bcrypt.no_user_verify()
     false
+  end
+
+  @doc """
+  Changeset for starting DID verification.
+  Generates a verification token the user must add to their DID document.
+  """
+  def did_verification_changeset(user, attrs) do
+    user
+    |> cast(attrs, [:did, :did_document_url])
+    |> validate_required([:did])
+    |> validate_format(:did, ~r/^did:web:.+$/, message: "must be a did:web identifier")
+    |> put_verification_token()
+    |> unique_constraint(:did)
+  end
+
+  defp put_verification_token(changeset) do
+    if get_field(changeset, :did_verification_token) do
+      changeset
+    else
+      token = :crypto.strong_rand_bytes(@verification_token_length) |> Base.url_encode64(padding: false)
+      put_change(changeset, :did_verification_token, token)
+    end
+  end
+
+  @doc """
+  Marks DID as verified.
+  """
+  def did_verified_changeset(user) do
+    change(user, did_verified_at: DateTime.utc_now(:second))
+  end
+
+  @doc """
+  Changeset for feed verification.
+  """
+  def feed_changeset(user, attrs) do
+    user
+    |> cast(attrs, [:feed_url, :feed_title])
+    |> validate_required([:feed_url])
+    |> validate_format(:feed_url, ~r/^https?:\/\/.+/, message: "must be a valid URL")
+  end
+
+  @doc """
+  Marks feed as verified.
+  """
+  def feed_verified_changeset(user, feed_title) do
+    now = DateTime.utc_now(:second)
+
+    change(user,
+      feed_verified_at: now,
+      feed_last_fetched_at: now,
+      feed_title: feed_title
+    )
+  end
+
+  @doc """
+  Marks onboarding as complete.
+  """
+  def onboarding_complete_changeset(user) do
+    change(user, onboarding_completed_at: DateTime.utc_now(:second))
+  end
+
+  @doc """
+  Checks if the user has verified their DID.
+  """
+  def did_verified?(%__MODULE__{did_verified_at: verified}), do: not is_nil(verified)
+
+  @doc """
+  Checks if the user has verified their feed.
+  """
+  def feed_verified?(%__MODULE__{feed_verified_at: verified}), do: not is_nil(verified)
+
+  @doc """
+  Checks if onboarding is complete.
+  """
+  def onboarding_complete?(%__MODULE__{onboarding_completed_at: completed}), do: not is_nil(completed)
+
+  @doc """
+  Returns the verification level (0-2):
+  - 0: Not verified
+  - 1: DID or Feed verified
+  - 2: Both verified
+  """
+  def verification_level(%__MODULE__{} = user) do
+    did = if did_verified?(user), do: 1, else: 0
+    feed = if feed_verified?(user), do: 1, else: 0
+    did + feed
   end
 end

@@ -12,8 +12,8 @@ defmodule Wepublic.Application do
       Wepublic.Repo,
       {DNSCluster, query: Application.get_env(:wepublic, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Wepublic.PubSub},
-      # Start a worker by calling: Wepublic.Worker.start_link(arg)
-      # {Wepublic.Worker, arg},
+      # Presence tracking for online users
+      WepublicWeb.Presence,
       # Start to serve requests, typically the last entry
       WepublicWeb.Endpoint
     ]
