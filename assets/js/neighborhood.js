@@ -468,8 +468,6 @@ export function renderNeighborhood(containerId, options = {}) {
   const figures = [];
   let viewerFigure = null;
 
-  console.log("[Neighborhood] Creating figures for", users.length, "users");
-
   users.forEach((user) => {
     const opacity = getOpacity(viewer, user);
     const figure = createFigure(user, opacity);
@@ -478,13 +476,8 @@ export function renderNeighborhood(containerId, options = {}) {
 
     if (user.isViewer) {
       viewerFigure = figure;
-      console.log("[Neighborhood] Viewer figure created:", user.name, "at", user.position);
     }
   });
-
-  if (!viewerFigure) {
-    console.warn("[Neighborhood] No viewer figure found! Users:", users.map(u => ({ id: u.id, isViewer: u.isViewer })));
-  }
 
   // Create target indicator
   const targetIndicator = createTargetIndicator();
@@ -755,7 +748,6 @@ export function renderNeighborhood(containerId, options = {}) {
     }
 
     if (handled) {
-      console.log("[Neighborhood] Key pressed:", event.code, "viewerFigure:", !!viewerFigure);
       event.preventDefault();
       event.stopPropagation();
     }
@@ -798,8 +790,6 @@ export function renderNeighborhood(containerId, options = {}) {
     raycaster.setFromCamera(mouse, camera);
     const intersects = raycaster.intersectObjects(scene.children, true);
 
-    console.log("[Neighborhood] Click detected, intersects:", intersects.length, "viewerFigure:", !!viewerFigure);
-
     for (const intersect of intersects) {
       let obj = intersect.object;
 
@@ -808,7 +798,6 @@ export function renderNeighborhood(containerId, options = {}) {
         if (obj.userData.isGround) {
           // Move to clicked position
           const point = intersect.point;
-          console.log("[Neighborhood] Ground clicked at", point.x.toFixed(1), point.z.toFixed(1));
           movement.target = { x: point.x, z: point.z };
           targetIndicator.position.set(point.x, 0, point.z);
           targetIndicator.visible = true;
@@ -817,7 +806,6 @@ export function renderNeighborhood(containerId, options = {}) {
 
         if (obj.userData.user) {
           // Clicked on a user
-          console.log("[Neighborhood] User clicked:", obj.userData.user.name);
           if (!obj.userData.user.isViewer && config.onUserClick) {
             config.onUserClick(obj.userData.user);
           }

@@ -34,6 +34,11 @@ defmodule Wepublic.Accounts.User do
     # Onboarding
     field :onboarding_completed_at, :utc_datetime
 
+    # Cryptographic identity (Ed25519 keypair)
+    # Enables self-sovereign identity via did:key
+    field :public_key, :binary
+    field :did_key, :string
+
     timestamps(type: :utc_datetime)
   end
 
@@ -275,4 +280,30 @@ defmodule Wepublic.Accounts.User do
     feed = if feed_verified?(user), do: 1, else: 0
     did + feed
   end
+
+  @doc """
+  Changeset for registering a cryptographic keypair.
+  The public key is stored, and did:key is derived from it.
+  """
+  def keypair_changeset(user, public_key) when is_binary(public_key) do
+    did_key = Wepublic.Identity.public_key_to_did(public_key)
+
+    user
+    |> change(%{public_key: public_key, did_key: did_key})
+    |> validate_required([:public_key, :did_key])
+    |> unique_constraint(:did_key)
+  end
+
+  @doc """
+  Checks if the user has a registered keypair.
+  """
+  def has_keypair?(%__MODULE__{public_key: pk}), do: not is_nil(pk)
+
+  @doc """
+  Returns the user's sovereign DID (did:key if available, otherwise did:web).
+  did:key is preferred as it's fully self-sovereign.
+  """
+  def sovereign_did(%__MODULE__{did_key: did_key}) when not is_nil(did_key), do: did_key
+  def sovereign_did(%__MODULE__{did: did}) when not is_nil(did), do: did
+  def sovereign_did(_), do: nil
 end

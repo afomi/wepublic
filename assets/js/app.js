@@ -29,6 +29,17 @@ import { renderNeighborhood } from "./neighborhood"
 // Neighborhood LiveView hook
 const Neighborhood = {
   mounted() {
+    this.initScene()
+
+    // Listen for user updates from server
+    this.handleEvent("update_users", ({ users }) => {
+      if (this.updateUsers) {
+        this.updateUsers(users)
+      }
+    })
+  },
+
+  initScene() {
     // Parse configuration from data attributes
     const config = {
       users: JSON.parse(this.el.dataset.users || "[]"),
@@ -43,15 +54,18 @@ const Neighborhood = {
     if (result) {
       this.cleanup = result.cleanup
       this.updateUsers = result.updateUsers
+      this.sceneInitialized = true
     }
-
-    // Listen for user updates from server
-    this.handleEvent("update_users", ({ users }) => {
-      if (this.updateUsers) {
-        this.updateUsers(users)
-      }
-    })
   },
+
+  updated() {
+    // Re-initialize if the canvas was somehow removed
+    const canvas = this.el.querySelector("canvas")
+    if (!canvas && this.sceneInitialized) {
+      this.initScene()
+    }
+  },
+
   destroyed() {
     if (this.cleanup) {
       this.cleanup()

@@ -25,6 +25,7 @@ defmodule WepublicWeb.MapLive do
       |> assign(:connections_with_presence, merge_connections_with_presence(connections, online_users))
       |> assign(:drawer_open, false)
       |> assign(:selected_user, nil)
+      |> assign(:show_user_modal, false)
       |> assign(:current_user, current_user)
       |> assign(:show_onboarding_prompt, should_show_onboarding?(current_user))
 
@@ -122,9 +123,125 @@ defmodule WepublicWeb.MapLive do
     {:noreply, assign(socket, :drawer_open, false)}
   end
 
-  def handle_event("user_clicked", %{"user_id" => _user_id}, socket) do
-    # Handle clicking on a user in the 3D scene
-    {:noreply, socket}
+  def handle_event("user_clicked", %{"user_id" => user_id}, socket) do
+    # Find the user data from the clicked user
+    user_data = find_user_by_id(socket.assigns, user_id)
+
+    {:noreply,
+     socket
+     |> assign(:selected_user, user_data)
+     |> assign(:show_user_modal, true)}
+  end
+
+  def handle_event("close_user_modal", _, socket) do
+    {:noreply,
+     socket
+     |> assign(:selected_user, nil)
+     |> assign(:show_user_modal, false)}
+  end
+
+  def handle_event("request_connection", %{"user_id" => user_id}, socket) do
+    current_user = socket.assigns.current_user
+
+    if current_user do
+      case Integer.parse(user_id) do
+        {id, _} ->
+          target_user = Accounts.get_user!(id)
+          Accounts.request_connection(current_user, target_user)
+
+          {:noreply,
+           socket
+           |> put_flash(:info, "Connection request sent!")
+           |> assign(:show_user_modal, false)}
+
+        :error ->
+          {:noreply, socket}
+      end
+    else
+      {:noreply,
+       socket
+       |> put_flash(:error, "You must be logged in to connect")
+       |> push_navigate(to: ~p"/users/log-in")}
+    end
+  end
+
+  defp find_user_by_id(assigns, user_id) do
+    # Extract numeric ID if present
+    numeric_id =
+      case user_id do
+        "user_" <> id -> String.to_integer(id)
+        "demo_" <> _ -> nil
+        _ -> nil
+      end
+
+    # Check online users first
+    online_match =
+      (assigns[:online_users] || [])
+      |> Enum.find(fn meta -> meta.user_id == user_id end)
+
+    if online_match do
+      # Get full user data if we have numeric ID
+      user =
+        if numeric_id do
+          try do
+            Accounts.get_user!(numeric_id)
+          rescue
+            _ -> nil
+          end
+        end
+
+      %{
+        id: user_id,
+        numeric_id: numeric_id,
+        display_name: online_match.display_name,
+        avatar_color: online_match.avatar_color,
+        did: user && user.did,
+        website: user && user.website,
+        verification_level: user && Wepublic.Accounts.User.verification_level(user) || 0,
+        feed_title: user && user.feed_title,
+        is_online: true,
+        is_demo: false
+      }
+    else
+      # Check if it's a demo user
+      demo_users = %{
+        "demo_alice" => %{
+          display_name: "Alice",
+          avatar_color: "#d94a8a",
+          website: "https://alice.example.com",
+          verification_level: 2,
+          is_demo: true
+        },
+        "demo_bob" => %{
+          display_name: "Bob",
+          avatar_color: "#8ad94a",
+          website: "https://bob.example.com",
+          verification_level: 1,
+          is_demo: true
+        },
+        "demo_carol" => %{
+          display_name: "Carol",
+          avatar_color: "#d9a84a",
+          website: "https://carol.example.com",
+          verification_level: 0,
+          is_demo: true
+        }
+      }
+
+      case Map.get(demo_users, user_id) do
+        nil ->
+          nil
+
+        demo ->
+          Map.merge(demo, %{
+            id: user_id,
+            numeric_id: nil,
+            did: nil,
+            feed_title: nil,
+            is_online: false
+          })
+      end
+    end
   end
 
   def handle_event("dismiss_onboarding", _, socket) do
@@ -264,10 +381,11 @@ defmodule WepublicWeb.MapLive do
     <div
       id="neighborhood-container"
       phx-hook="Neighborhood"
+      phx-update="ignore"
       data-users={Jason.encode!(@map_users)}
       data-current-user-id={if @current_user, do: "user_#{@current_user.id}", else: ""}
       data-connections={@connection_ids_json}
-      class="w-full h-screen"
+      class="w-full h-screen relative z-0"
     >
     </div>
 
@@ -304,6 +422,13 @@ defmodule WepublicWeb.MapLive do
       open={@drawer_open}
       connections={@connections_with_presence}
       current_user={@current_user}
+    />
+
+    <.user_profile_modal
+      :if={@show_user_modal && @selected_user}
+      user={@selected_user}
+      current_user={@current_user}
+      connections={@connections}
     />
     """
   end
@@ -429,6 +554,221 @@ defmodule WepublicWeb.MapLive do
     ~H"""
     <span :if={@level == 2} class="text-green-400 text-xs">✓✓</span>
     <span :if={@level == 1} class="text-blue-400 text-xs">✓</span>
+    """
+  end
+
+  defp user_profile_modal(assigns) do
+    is_connected =
+      Enum.any?(assigns.connections, fn conn ->
+        conn.id == assigns.user.numeric_id
+      end)
+
+    assigns = assign(assigns, :is_connected, is_connected)
+
+    ~H"""
+    <div
+      class="fixed inset-0 z-50 flex items-center justify-center p-4"
+      phx-window-keydown="close_user_modal"
+      phx-key="Escape"
+    >
+      <div
+        class="absolute inset-0 bg-black/60"
+        phx-click="close_user_modal"
+      >
+      </div>
+
+      <div class="relative bg-gray-800 rounded-xl shadow-2xl max-w-md w-full overflow-hidden">
+        <button
+          phx-click="close_user_modal"
+          class="absolute top-3 right-3 text-gray-400 hover:text-white z-10"
+        >
+          <svg
+            class="w-6 h-6"
+            fill="none"
+            stroke="currentColor"
+            viewBox="0 0 24 24"
+          >
+            <path
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              stroke-width="2"
+              d="M6 18L18 6M6 6l12 12"
+            />
+          </svg>
+        </button>
+
+        <div class="p-6">
+          <div class="flex items-start gap-4">
+            <div class="relative">
+              <div
+                class="w-16 h-16 rounded-full flex items-center justify-center text-white text-2xl font-bold"
+                style={"background-color: #{@user.avatar_color}"}
+              >
+                {String.first(@user.display_name || "?")}
+              </div>
+              <div
+                :if={@user.is_online}
+                class="absolute -bottom-1 -right-1 w-4 h-4 bg-green-400 rounded-full border-2 border-gray-800"
+              >
+              </div>
+            </div>
+
+            <div class="flex-1 min-w-0">
+              <div class="flex items-center gap-2">
+                <h2 class="text-xl font-bold text-white truncate">
+                  {@user.display_name}
+                </h2>
+                <.verification_badge_large level={@user.verification_level} />
+              </div>
+
+              <div
+                :if={@user.is_online}
+                class="text-green-400 text-sm"
+              >
+                Online now
+              </div>
+
+              <div
+                :if={@user.is_demo}
+                class="text-gray-500 text-sm italic"
+              >
+                Demo user
+              </div>
+            </div>
+          </div>
+
+          <div class="mt-6 space-y-3">
+            <div
+              :if={@user.did}
+              class="flex items-center gap-2 text-sm"
+            >
+              <span class="text-gray-400 w-16">DID</span>
+              <span class="text-blue-400 truncate">{@user.did}</span>
+            </div>
+
+            <div
+              :if={@user.website}
+              class="flex items-center gap-2 text-sm"
+            >
+              <span class="text-gray-400 w-16">Website</span>
+              <a
+                href={@user.website}
+                target="_blank"
+                rel="noopener"
+                class="text-blue-400 hover:underline truncate"
+              >
+                {@user.website}
+              </a>
+            </div>
+
+            <div
+              :if={@user.feed_title}
+              class="flex items-center gap-2 text-sm"
+            >
+              <span class="text-gray-400 w-16">Feed</span>
+              <span class="text-white truncate">{@user.feed_title}</span>
+            </div>
+          </div>
+
+          <div class="mt-6 pt-4 border-t border-gray-700">
+            <div class="flex items-center justify-between mb-4">
+              <span class="text-gray-400 text-sm">Verification Level</span>
+              <.verification_level_display level={@user.verification_level} />
+            </div>
+          </div>
+
+          <div class="mt-4 flex gap-3">
+            <%= if @user.is_demo do %>
+              <div class="flex-1 text-center text-gray-500 text-sm py-2">
+                Demo users cannot be connected
+              </div>
+            <% else %>
+              <%= if @is_connected do %>
+                <div class="flex-1 bg-green-600/20 text-green-400 py-2 px-4 rounded-lg text-center">
+                  Connected
+                </div>
+              <% else %>
+                <%= if @current_user do %>
+                  <button
+                    phx-click="request_connection"
+                    phx-value-user_id={@user.numeric_id}
+                    class="flex-1 bg-blue-600 hover:bg-blue-700 text-white py-2 px-4 rounded-lg transition font-medium"
+                  >
+                    Connect
+                  </button>
+                <% else %>
+                  <.link
+                    navigate={~p"/users/log-in"}
+                    class="flex-1 bg-blue-600 hover:bg-blue-700 text-white py-2 px-4 rounded-lg transition font-medium text-center"
+                  >
+                    Log in to Connect
+                  </.link>
+                <% end %>
+              <% end %>
+
+              <a
+                :if={@user.website}
+                href={@user.website}
+                target="_blank"
+                rel="noopener"
+                class="bg-gray-700 hover:bg-gray-600 text-white py-2 px-4 rounded-lg transition"
+              >
+                Visit Site
+              </a>
+            <% end %>
+          </div>
+        </div>
+      </div>
+    </div>
+    """
+  end
+
+  defp verification_badge_large(assigns) do
+    ~H"""
+    <span
+      :if={@level == 2}
+      class="inline-flex items-center gap-1 bg-green-500/20 text-green-400 px-2 py-0.5 rounded-full text-xs"
+    >
+      <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
+        <path
+          fill-rule="evenodd"
+          d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z"
+          clip-rule="evenodd"
+        />
+      </svg>
+      Verified
+    </span>
+    <span
+      :if={@level == 1}
+      class="inline-flex items-center gap-1 bg-blue-500/20 text-blue-400 px-2 py-0.5 rounded-full text-xs"
+    >
+      <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
+        <path
+          fill-rule="evenodd"
+          d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z"
+          clip-rule="evenodd"
+        />
+      </svg>
+      Partial
+    </span>
+    """
+  end
+
+  defp verification_level_display(assigns) do
+    ~H"""
+    <div class="flex items-center gap-1">
+      <div class={[
+        "w-3 h-3 rounded-full",
+        @level >= 1 && "bg-blue-400" || "bg-gray-600"
+      ]}>
+      </div>
+      <div class={[
+        "w-3 h-3 rounded-full",
+        @level >= 2 && "bg-green-400" || "bg-gray-600"
+      ]}>
+      </div>
+      <span class="text-white text-sm ml-1">{@level}/2</span>
+    </div>
     """
   end
 end
