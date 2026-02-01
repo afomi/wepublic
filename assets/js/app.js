@@ -37,6 +37,20 @@ const Neighborhood = {
         this.updateUsers(users)
       }
     })
+
+    // Listen for world state updates
+    this.handleEvent("world_update", ({ entities }) => {
+      if (this.updateEntities) {
+        this.updateEntities(entities)
+      }
+    })
+
+    // Listen for position updates from other users
+    this.handleEvent("user_position", ({ user_id, position }) => {
+      if (this.updateUserPosition) {
+        this.updateUserPosition(user_id, position)
+      }
+    })
   },
 
   initScene() {
@@ -47,6 +61,14 @@ const Neighborhood = {
       connections: JSON.parse(this.el.dataset.connections || "[]"),
       onUserClick: (user) => {
         this.pushEvent("user_clicked", { user_id: user.id })
+      },
+      onMove: (direction) => {
+        // Send movement intent to server
+        this.pushEvent("move", { direction: direction })
+      },
+      onMoveTo: (x, z) => {
+        // Send click-to-move intent to server
+        this.pushEvent("move_to", { x: x, z: z })
       }
     }
 
@@ -54,6 +76,8 @@ const Neighborhood = {
     if (result) {
       this.cleanup = result.cleanup
       this.updateUsers = result.updateUsers
+      this.updateEntities = result.updateEntities
+      this.updateUserPosition = result.updateUserPosition
       this.sceneInitialized = true
     }
   },

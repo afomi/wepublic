@@ -4,17 +4,34 @@ defmodule WepublicWeb.MapLive do
   alias WepublicWeb.Presence
   alias Wepublic.Accounts
   alias Wepublic.Accounts.User
+  alias Wepublic.MapWorld
 
   @impl true
   def mount(_params, _session, socket) do
     current_user = get_current_user(socket)
 
-    if connected?(socket) do
-      Presence.subscribe("map")
-      Presence.track_user(socket, "map")
-    end
-
+    # Generate a consistent user_id for this session
+    my_user_id = get_my_user_id(current_user)
     connections = get_user_connections(current_user)
+
+    world_entities =
+      if connected?(socket) do
+        # Subscribe to presence and world updates
+        Presence.subscribe("map")
+        Presence.track_user(socket, "map")
+        MapWorld.subscribe()
+
+        # Join the world - server assigns spawn position
+        # join/2 is a call, so it returns after the entity is added
+        user_meta = build_user_meta(current_user, connections)
+        MapWorld.join(my_user_id, user_meta)
+
+        # Now get all entities (including ourselves)
+        MapWorld.get_entities()
+      else
+        %{}
+      end
+
     online_users = Presence.list_users("map")
 
     socket =
@@ -27,9 +44,38 @@ defmodule WepublicWeb.MapLive do
       |> assign(:selected_user, nil)
       |> assign(:show_user_modal, false)
       |> assign(:current_user, current_user)
+      |> assign(:my_user_id, my_user_id)
+      |> assign(:world_entities, world_entities)
       |> assign(:show_onboarding_prompt, should_show_onboarding?(current_user))
 
     {:ok, socket}
+  end
+
+  @impl true
+  def terminate(_reason, socket) do
+    # Leave the world when disconnecting
+    if socket.assigns[:my_user_id] do
+      MapWorld.leave(socket.assigns.my_user_id)
+    end
+
+    :ok
+  end
+
+  defp get_my_user_id(nil), do: "anonymous_#{:erlang.unique_integer([:positive])}"
+  defp get_my_user_id(%{id: id}), do: "user_#{id}"
+
+  defp build_user_meta(nil, _connections) do
+    %{name: "Anonymous", display_name: "Anonymous", color: "#4a90d9"}
+  end
+
+  defp build_user_meta(user, connections) do
+    %{
+      name: user.display_name || user.email |> String.split("@") |> hd(),
+      display_name: user.display_name || user.email |> String.split("@") |> hd(),
+      color: user.avatar_color || "#4a90d9",
+      verification_level: User.verification_level(user),
+      connections: Enum.map(connections, & &1.id)
+    }
   end
 
   defp get_current_user(socket) do
@@ -114,6 +160,27 @@ defmodule WepublicWeb.MapLive do
      )}
   end
 
+  # Handle world state updates from MapWorld GenServer
+  def handle_info({:world_update, entities}, socket) do
+    require Logger
+    entity_ids = Map.keys(entities)
+    Logger.warning("WORLD_UPDATE: my_user_id=#{socket.assigns.my_user_id}, entity_ids=#{inspect(entity_ids)}")
+
+    {:noreply,
+     socket
+     |> assign(:world_entities, entities)
+     |> push_event("world_update", %{entities: entities_to_list(entities, socket.assigns.my_user_id)})}
+  end
+
+  # Handle position updates from MapWorld GenServer
+  # Send ALL position updates to client (including our own) so client stays in sync with server
+  def handle_info({:position_update, user_id, position}, socket) do
+    require Logger
+    Logger.warning("POSITION_UPDATE: sending to client, user_id=#{user_id}, my_user_id=#{socket.assigns.my_user_id}")
+
+    {:noreply, push_event(socket, "user_position", %{user_id: user_id, position: position})}
+  end
+
   @impl true
   def handle_event("toggle_drawer", _, socket) do
     {:noreply, assign(socket, :drawer_open, not socket.assigns.drawer_open)}
@@ -163,6 +230,42 @@ defmodule WepublicWeb.MapLive do
        |> put_flash(:error, "You must be logged in to connect")
        |> push_navigate(to: ~p"/users/log-in")}
     end
+  end
+
+  def handle_event("dismiss_onboarding", _, socket) do
+    {:noreply, assign(socket, :show_onboarding_prompt, false)}
+  end
+
+  # Handle movement from the viewer - send to MapWorld
+  def handle_event("move", %{"direction" => direction}, socket) do
+    user_id = socket.assigns.my_user_id
+
+    require Logger
+    Logger.warning("MOVE EVENT: user=#{user_id} direction=#{direction}")
+
+    dir_atom = case direction do
+      "up" -> :up
+      "down" -> :down
+      "left" -> :left
+      "right" -> :right
+      _ -> nil
+    end
+
+    if dir_atom do
+      MapWorld.move(user_id, dir_atom)
+    end
+
+    {:noreply, socket}
+  end
+
+  def handle_event("move_to", %{"x" => x, "z" => z}, socket) do
+    user_id = socket.assigns.my_user_id
+
+    require Logger
+    Logger.warning("MOVE_TO EVENT: user=#{user_id} x=#{x} z=#{z}")
+
+    MapWorld.move(user_id, {:to, x, z})
+    {:noreply, socket}
   end
 
   defp find_user_by_id(assigns, user_id) do
@@ -244,122 +347,39 @@ defmodule WepublicWeb.MapLive do
     end
   end
 
-  def handle_event("dismiss_onboarding", _, socket) do
-    {:noreply, assign(socket, :show_onboarding_prompt, false)}
+  defp get_map_users(assigns) do
+    my_user_id = assigns[:my_user_id]
+    world_entities = assigns[:world_entities] || %{}
+    connections = assigns[:connections] || []
+    connection_ids = Enum.map(connections, &"user_#{&1.id}")
+
+    # Convert world entities to client format
+    entities_to_list(world_entities, my_user_id, connection_ids)
   end
 
-  defp get_map_users(assigns) do
-    current_user = assigns[:current_user]
-    online_users = assigns[:online_users] || []
-    connections = assigns[:connections] || []
+  defp entities_to_list(entities, my_user_id) do
+    entities_to_list(entities, my_user_id, [])
+  end
 
-    # Build user list for the 3D scene from online presence
-    base_users =
-      online_users
-      |> Enum.with_index()
-      |> Enum.map(fn {meta, index} ->
-        user_id =
-          case meta.user_id do
-            "user_" <> id -> String.to_integer(id)
-            _ -> nil
-          end
+  defp entities_to_list(entities, my_user_id, connection_ids) do
+    entities
+    |> Map.values()
+    |> Enum.map(fn entity ->
+      is_viewer = entity.id == my_user_id
 
-        is_current = current_user && user_id == current_user.id
-
-        %{
-          id: meta.user_id,
-          name: meta.display_name,
-          display_name: meta.display_name,
-          color: meta.avatar_color,
-          position: %{x: -5 + index * 7, z: (index - 2) * 3},
-          connections: if(is_current, do: Enum.map(connections, &"user_#{&1.id}"), else: []),
-          isViewer: is_current,
-          verificationLevel: 0,
-          hasProducts: false
-        }
-      end)
-
-    # Check if we have a viewer in the list
-    has_viewer = Enum.any?(base_users, & &1.isViewer)
-
-    # Build the viewer user (current user or anonymous)
-    viewer_user =
-      if current_user do
-        %{
-          id: "user_#{current_user.id}",
-          name: current_user.display_name || current_user.email |> String.split("@") |> hd(),
-          display_name: current_user.display_name || current_user.email |> String.split("@") |> hd(),
-          color: current_user.avatar_color || "#4a90d9",
-          position: %{x: 0, z: 0},
-          connections: Enum.map(connections, &"user_#{&1.id}"),
-          isViewer: true,
-          verificationLevel: Wepublic.Accounts.User.verification_level(current_user),
-          hasProducts: false
-        }
-      else
-        %{
-          id: "viewer",
-          name: "You",
-          display_name: "You",
-          color: "#4a90d9",
-          position: %{x: 0, z: 0},
-          connections: [],
-          isViewer: true,
-          verificationLevel: 0,
-          hasProducts: false
-        }
-      end
-
-    # Add demo NPCs
-    demo_users = [
       %{
-        id: "demo_alice",
-        name: "Alice",
-        display_name: "Alice",
-        color: "#d94a8a",
-        position: %{x: 8, z: 5},
-        connections: [],
-        isViewer: false,
-        verificationLevel: 2,
-        hasProducts: true,
-        website: "https://alice.example.com"
-      },
-      %{
-        id: "demo_bob",
-        name: "Bob",
-        display_name: "Bob",
-        color: "#8ad94a",
-        position: %{x: 15, z: -8},
-        connections: [],
-        isViewer: false,
-        verificationLevel: 1,
-        hasProducts: false,
-        website: "https://bob.example.com"
-      },
-      %{
-        id: "demo_carol",
-        name: "Carol",
-        display_name: "Carol",
-        color: "#d9a84a",
-        position: %{x: -12, z: 10},
-        connections: [],
-        isViewer: false,
-        verificationLevel: 0,
-        hasProducts: false,
-        website: "https://carol.example.com"
+        id: entity.id,
+        name: entity.name,
+        display_name: entity.display_name,
+        color: entity.color,
+        position: entity.position,
+        connections: if(is_viewer, do: connection_ids, else: entity[:connections] || []),
+        isViewer: is_viewer,
+        verificationLevel: entity[:verification_level] || 0,
+        hasProducts: entity[:has_products] || false
       }
-    ]
-
-    # Combine: viewer first, then online users (excluding viewer duplicate), then demos
-    other_online =
-      if has_viewer do
-        # Remove the viewer from base_users since we're adding them separately
-        Enum.reject(base_users, & &1.isViewer)
-      else
-        base_users
-      end
-
-    [viewer_user | other_online] ++ demo_users
+    end)
+    |> Enum.sort_by(fn e -> if e.isViewer, do: 0, else: 1 end)
   end
 
   defp connection_ids_json(connections) do
@@ -383,7 +403,7 @@ defmodule WepublicWeb.MapLive do
       phx-hook="Neighborhood"
       phx-update="ignore"
       data-users={Jason.encode!(@map_users)}
-      data-current-user-id={if @current_user, do: "user_#{@current_user.id}", else: ""}
+      data-current-user-id={@my_user_id}
       data-connections={@connection_ids_json}
       class="w-full h-screen relative z-0"
     >

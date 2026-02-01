@@ -36,7 +36,8 @@ defmodule WepublicWeb.Presence do
           joined_at: DateTime.utc_now(),
           user_id: get_user_id(user),
           display_name: get_display_name(user),
-          avatar_color: get_avatar_color(user)
+          avatar_color: get_avatar_color(user),
+          position: %{x: 0.0, z: 0.0}
         },
         meta
       )
@@ -56,6 +57,18 @@ defmodule WepublicWeb.Presence do
     update(self(), location, key, fn existing ->
       Map.merge(existing, meta)
     end)
+  end
+
+  @doc """
+  Broadcasts a position update for a user to all subscribers.
+  This is a lightweight broadcast that doesn't require a full presence diff.
+  """
+  def broadcast_position(location, user_id, position) do
+    Phoenix.PubSub.broadcast(
+      Wepublic.PubSub,
+      "presence:#{location}",
+      {:position_update, %{user_id: user_id, position: position}}
+    )
   end
 
   @doc """

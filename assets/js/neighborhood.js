@@ -34,6 +34,8 @@ export function renderNeighborhood(containerId, options = {}) {
     currentUserId: options.currentUserId || null,
     connections: options.connections || [],
     onUserClick: options.onUserClick || null,
+    onMove: options.onMove || null,        // Send movement direction to server
+    onMoveTo: options.onMoveTo || null,    // Send click-to-move target to server
     ...options
   };
 
@@ -483,10 +485,8 @@ export function renderNeighborhood(containerId, options = {}) {
   const targetIndicator = createTargetIndicator();
   scene.add(targetIndicator);
 
-  // Movement state
+  // Movement state - now server-authoritative, client just sends intents
   const movement = {
-    target: null,
-    speed: 8, // meters per second
     keys: {
       up: false,
       down: false,
@@ -494,6 +494,13 @@ export function renderNeighborhood(containerId, options = {}) {
       right: false
     }
   };
+
+  // Track entity positions for interpolation
+  const entityPositions = new Map();
+
+  // Movement intent throttling
+  let lastMoveIntent = 0;
+  const MOVE_INTENT_INTERVAL = 50; // ms between move intents
 
   // Update info panel
   function updateInfoPanel() {
@@ -561,20 +568,6 @@ export function renderNeighborhood(containerId, options = {}) {
   let animationId = null;
   let lastTime = performance.now();
 
-  // Create walk paths for NPCs only
-  const walkPaths = figures.map((figure, i) => {
-    if (figure.userData.isViewer) {
-      return null; // Viewer doesn't auto-walk
-    }
-    return {
-      baseX: figure.userData.basePosition?.x || 0,
-      baseZ: figure.userData.basePosition?.z || 0,
-      speed: 0.2 + (i * 0.05),
-      radius: 1.5 + (i * 0.3),
-      offset: i * Math.PI / 3
-    };
-  });
-
   function animate() {
     animationId = requestAnimationFrame(animate);
 
@@ -584,61 +577,54 @@ export function renderNeighborhood(containerId, options = {}) {
 
     time += delta;
 
-    // Handle viewer movement
-    if (viewerFigure) {
-      let dx = 0;
-      let dz = 0;
-
-      // Keyboard movement (isometric adjusted)
-      if (movement.keys.up) { dx -= 1; dz -= 1; }
-      if (movement.keys.down) { dx += 1; dz += 1; }
-      if (movement.keys.left) { dx -= 1; dz += 1; }
-      if (movement.keys.right) { dx += 1; dz -= 1; }
-
-      // Normalize diagonal movement
-      if (dx !== 0 || dz !== 0) {
-        const len = Math.sqrt(dx * dx + dz * dz);
-        dx = (dx / len) * movement.speed * delta;
-        dz = (dz / len) * movement.speed * delta;
-
-        viewerFigure.position.x += dx;
-        viewerFigure.position.z += dz;
-
-        // Face movement direction
-        viewerFigure.rotation.y = Math.atan2(dx, dz);
-
-        // Cancel click-to-move target
-        movement.target = null;
-        targetIndicator.visible = false;
+    // Send movement intents to server (throttled)
+    if (now - lastMoveIntent > MOVE_INTENT_INTERVAL && config.onMove) {
+      if (movement.keys.up) {
+        config.onMove("up");
+        lastMoveIntent = now;
+      } else if (movement.keys.down) {
+        config.onMove("down");
+        lastMoveIntent = now;
+      } else if (movement.keys.left) {
+        config.onMove("left");
+        lastMoveIntent = now;
+      } else if (movement.keys.right) {
+        config.onMove("right");
+        lastMoveIntent = now;
       }
+    }
 
-      // Click-to-move
-      if (movement.target) {
-        const tx = movement.target.x - viewerFigure.position.x;
-        const tz = movement.target.z - viewerFigure.position.z;
-        const dist = Math.sqrt(tx * tx + tz * tz);
+    // Interpolate all figures to their server positions
+    figures.forEach((figure) => {
+      const userId = figure.userData.user?.id;
+      const targetPos = entityPositions.get(userId);
 
-        if (dist < 0.5) {
-          // Arrived
-          movement.target = null;
-          targetIndicator.visible = false;
-        } else {
+      if (targetPos) {
+        const lerpSpeed = 10 * delta; // Smooth follow
+        const dx = targetPos.x - figure.position.x;
+        const dz = targetPos.z - figure.position.z;
+        const dist = Math.sqrt(dx * dx + dz * dz);
+
+        if (dist > 0.05) {
           // Move towards target
-          const moveSpeed = movement.speed * delta;
-          const moveRatio = Math.min(moveSpeed / dist, 1);
-
-          viewerFigure.position.x += tx * moveRatio;
-          viewerFigure.position.z += tz * moveRatio;
+          const ratio = Math.min(lerpSpeed / dist, 1);
+          figure.position.x += dx * ratio;
+          figure.position.z += dz * ratio;
 
           // Face movement direction
-          viewerFigure.rotation.y = Math.atan2(tx, tz);
+          figure.rotation.y = Math.atan2(dx, dz);
+
+          // Walking animation
+          figure.position.y = Math.abs(Math.sin(time * 8)) * 0.08;
+        } else {
+          figure.position.y = 0;
         }
       }
 
       // Animate viewer highlight pulse
-      if (viewerFigure.userData.viewerHighlight) {
+      if (figure.userData.isViewer && figure.userData.viewerHighlight) {
         const pulse = 0.7 + Math.sin(time * 3) * 0.3;
-        viewerFigure.userData.viewerHighlight.children.forEach(child => {
+        figure.userData.viewerHighlight.children.forEach(child => {
           if (child.material) {
             child.material.opacity = child.userData?.baseOpacity
               ? child.userData.baseOpacity * pulse
@@ -646,34 +632,6 @@ export function renderNeighborhood(containerId, options = {}) {
           }
         });
       }
-
-      // Walking animation for viewer
-      const isMoving = (dx !== 0 || dz !== 0) || movement.target;
-      if (isMoving) {
-        viewerFigure.position.y = Math.abs(Math.sin(time * 8)) * 0.08;
-      } else {
-        viewerFigure.position.y = 0;
-      }
-    }
-
-    // Animate NPC figures
-    figures.forEach((figure, i) => {
-      if (figure.userData.isViewer) return;
-
-      const path = walkPaths[i];
-      if (!path) return;
-
-      const walkCycle = time * path.speed + path.offset;
-
-      // Simple circular path
-      figure.position.x = path.baseX + Math.sin(walkCycle) * path.radius;
-      figure.position.z = path.baseZ + Math.cos(walkCycle) * path.radius;
-
-      // Face direction of movement
-      figure.rotation.y = walkCycle + Math.PI;
-
-      // Subtle bobbing
-      figure.position.y = Math.abs(Math.sin(walkCycle * 4)) * 0.05;
 
       // Animate halo rotation
       if (figure.userData.halo) {
@@ -686,6 +644,7 @@ export function renderNeighborhood(containerId, options = {}) {
         figure.userData.sellerBadge.rotation.y = time;
       }
     });
+
 
     // Animate target indicator
     if (targetIndicator.visible) {
@@ -796,11 +755,15 @@ export function renderNeighborhood(containerId, options = {}) {
       // Check if clicked on ground for movement
       while (obj) {
         if (obj.userData.isGround) {
-          // Move to clicked position
+          // Send move-to intent to server
           const point = intersect.point;
-          movement.target = { x: point.x, z: point.z };
+          if (config.onMoveTo) {
+            config.onMoveTo(point.x, point.z);
+          }
           targetIndicator.position.set(point.x, 0, point.z);
           targetIndicator.visible = true;
+          // Hide after a short delay
+          setTimeout(() => { targetIndicator.visible = false; }, 500);
           return;
         }
 
@@ -826,6 +789,108 @@ export function renderNeighborhood(containerId, options = {}) {
     updateInfoPanel();
   }
 
+  // Update all entities from server (full world state)
+  function updateEntities(entities) {
+    console.log("[neighborhood] updateEntities received:", entities.length, "entities");
+    console.log("[neighborhood] entity IDs:", entities.map(e => e.id));
+
+    const existingIds = new Set(figures.map(f => f.userData.user?.id));
+    const newIds = new Set(entities.map(e => e.id));
+
+    console.log("[neighborhood] existing figure IDs:", Array.from(existingIds));
+    console.log("[neighborhood] new entity IDs:", Array.from(newIds));
+
+    // Add figures for new entities
+    entities.forEach(entity => {
+      entityPositions.set(entity.id, { x: entity.position.x, z: entity.position.z });
+
+      if (!existingIds.has(entity.id)) {
+        // New entity - create a figure for it
+        const user = {
+          id: entity.id,
+          name: entity.name || entity.display_name,
+          display_name: entity.display_name || entity.name,
+          color: entity.color,
+          position: entity.position,
+          connections: entity.connections || [],
+          isViewer: entity.isViewer || false,
+          verificationLevel: entity.verificationLevel || 0,
+          hasProducts: entity.hasProducts || false
+        };
+        const opacity = getOpacity(viewer, user);
+        const figure = createFigure(user, opacity);
+        figures.push(figure);
+        scene.add(figure);
+
+        // Update viewerFigure if this is the viewer
+        if (user.isViewer) {
+          viewerFigure = figure;
+        }
+      }
+    });
+
+    // Remove figures for entities that left
+    for (let i = figures.length - 1; i >= 0; i--) {
+      const figure = figures[i];
+      const userId = figure.userData.user?.id;
+      if (userId && !newIds.has(userId)) {
+        scene.remove(figure);
+        figures.splice(i, 1);
+        entityPositions.delete(userId);
+      }
+    }
+
+    // Update the users array for info panel
+    config.users = entities.map(entity => ({
+      id: entity.id,
+      name: entity.name || entity.display_name,
+      display_name: entity.display_name || entity.name,
+      color: entity.color,
+      position: entity.position,
+      connections: entity.connections || [],
+      isViewer: entity.isViewer || false,
+      verificationLevel: entity.verificationLevel || 0,
+      hasProducts: entity.hasProducts || false
+    }));
+
+    updateInfoPanel();
+  }
+
+  // Update a single user's position (called from LiveView)
+  function updateUserPosition(userId, position) {
+    console.log("[neighborhood] updateUserPosition:", userId, position);
+    entityPositions.set(userId, { x: position.x, z: position.z });
+
+    // If we don't have a figure for this user yet, we'll create one
+    // This can happen if position updates arrive before world_update
+    const existingFigure = figures.find(f => f.userData.user?.id === userId);
+    if (!existingFigure) {
+      console.log("[neighborhood] Creating figure for unknown user:", userId);
+      // Create a basic figure with placeholder data
+      const user = {
+        id: userId,
+        name: userId,
+        display_name: userId,
+        color: "#888888",
+        position: position,
+        connections: [],
+        isViewer: false,
+        verificationLevel: 0,
+        hasProducts: false
+      };
+      const figure = createFigure(user, 0.4);
+      figures.push(figure);
+      scene.add(figure);
+    }
+  }
+
+  // Initialize positions from initial user data
+  users.forEach(user => {
+    if (user.position) {
+      entityPositions.set(user.id, { x: user.position.x, z: user.position.z });
+    }
+  });
+
   // Return cleanup function and API for LiveView hook integration
   return {
     cleanup: function() {
@@ -843,6 +908,8 @@ export function renderNeighborhood(containerId, options = {}) {
       }
     },
     updateUsers: updateUsers,
+    updateEntities: updateEntities,
+    updateUserPosition: updateUserPosition,
     getViewerPosition: () => viewerFigure ? { x: viewerFigure.position.x, z: viewerFigure.position.z } : null
   };
 }

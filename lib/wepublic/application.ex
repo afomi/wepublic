@@ -14,6 +14,8 @@ defmodule Wepublic.Application do
       {Phoenix.PubSub, name: Wepublic.PubSub},
       # Presence tracking for online users
       WepublicWeb.Presence,
+      # World state manager for map entities
+      Wepublic.MapWorld,
       # Start to serve requests, typically the last entry
       WepublicWeb.Endpoint
     ]
