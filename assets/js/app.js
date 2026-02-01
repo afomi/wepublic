@@ -60,11 +60,16 @@ const Neighborhood = {
     })
 
     // Listen for location changes (travel)
-    this.handleEvent("location_changed", ({ location, objects }) => {
+    this.handleEvent("location_changed", ({ location, objects, entities }) => {
+      console.log("[app.js] location_changed:", location?.name, "objects:", objects?.length, "entities:", entities?.length)
       if (this.updateLocation) {
         this.updateLocation(location)
       }
-      // Clear and re-add all objects for new location
+      // Teleport all entities to their new positions
+      if (entities && this.teleportEntities) {
+        this.teleportEntities(entities)
+      }
+      // Add objects for new location (updateLocation clears old ones)
       if (objects && this.addWorldObject) {
         objects.forEach(obj => this.addWorldObject(obj))
       }
@@ -90,6 +95,43 @@ const Neighborhood = {
         this.setPlaceMode(enabled)
       }
     })
+
+    // Listen for conversation state changes
+    this.handleEvent("user_conversation_state", ({ user_id, in_conversation, is_typing }) => {
+      if (this.setUserConversationState) {
+        this.setUserConversationState(user_id, in_conversation, is_typing)
+      }
+    })
+
+    // Listen for typing indicators
+    this.handleEvent("user_typing", ({ user_id, typing }) => {
+      if (this.setUserTyping) {
+        this.setUserTyping(user_id, typing)
+      }
+    })
+
+    // Listen for message notification indicators
+    this.handleEvent("user_has_message", ({ user_id, has_message }) => {
+      if (this.setUserHasMessage) {
+        this.setUserHasMessage(user_id, has_message)
+      }
+    })
+
+    // Listen for user appearing (arrived at my location)
+    this.handleEvent("user_appeared", ({ user_id }) => {
+      console.log("[app.js] user_appeared:", user_id)
+      if (this.showUserAppear) {
+        this.showUserAppear(user_id)
+      }
+    })
+
+    // Listen for user disappearing (left my location)
+    this.handleEvent("user_disappeared", ({ user_id }) => {
+      console.log("[app.js] user_disappeared:", user_id)
+      if (this.showUserDisappear) {
+        this.showUserDisappear(user_id)
+      }
+    })
   },
 
   initScene() {
@@ -98,6 +140,7 @@ const Neighborhood = {
       users: JSON.parse(this.el.dataset.users || "[]"),
       currentUserId: this.el.dataset.currentUserId || null,
       connections: JSON.parse(this.el.dataset.connections || "[]"),
+      initialLocation: JSON.parse(this.el.dataset.location || "null"),
       onUserClick: (user) => {
         this.pushEvent("user_clicked", { user_id: user.id })
       },
@@ -126,6 +169,12 @@ const Neighborhood = {
       this.addWorldObject = result.addWorldObject
       this.updateWorldObject = result.updateWorldObject
       this.setPlaceMode = result.setPlaceMode
+      this.setUserConversationState = result.setUserConversationState
+      this.setUserTyping = result.setUserTyping
+      this.setUserHasMessage = result.setUserHasMessage
+      this.teleportEntities = result.teleportEntities
+      this.showUserAppear = result.showUserAppear
+      this.showUserDisappear = result.showUserDisappear
       this.sceneInitialized = true
     }
   },
@@ -148,11 +197,24 @@ const Neighborhood = {
 // Expose for non-LiveView usage
 window.neighborhood = (options) => renderNeighborhood("neighborhood-container", options)
 
+// ScrollToBottom hook for chat messages
+const ScrollToBottom = {
+  mounted() {
+    this.scrollToBottom()
+  },
+  updated() {
+    this.scrollToBottom()
+  },
+  scrollToBottom() {
+    this.el.scrollTop = this.el.scrollHeight
+  }
+}
+
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
 const liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: 2500,
   params: {_csrf_token: csrfToken},
-  hooks: {...colocatedHooks, Neighborhood},
+  hooks: {...colocatedHooks, Neighborhood, ScrollToBottom},
 })
 
 // Show progress bar on live navigation and form submits

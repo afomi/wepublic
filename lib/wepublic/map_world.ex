@@ -50,6 +50,10 @@ defmodule Wepublic.MapWorld do
   # Visibility radius in meters
   @visibility_radius 100.0
 
+  # Meters per degree (approximate at mid-latitudes)
+  @meters_per_degree_lat 111_320.0
+  @meters_per_degree_long 85_000.0  # Approximate for ~38° latitude
+
   # State structure
   defstruct entities: %{},
             spawn_index: 0,
@@ -89,6 +93,13 @@ defmodule Wepublic.MapWorld do
   """
   def get_entities do
     GenServer.call(__MODULE__, :get_entities)
+  end
+
+  @doc """
+  Get entities at a specific location.
+  """
+  def get_entities_at_location(location_id) do
+    GenServer.call(__MODULE__, {:get_entities_at_location, location_id})
   end
 
   @doc """
@@ -162,7 +173,17 @@ defmodule Wepublic.MapWorld do
     # Load default location
     current_location = Geo.get_location_by_slug(@default_location_slug)
 
-    # Initialize with demo NPCs at fixed positions
+    # Base coordinates (Vacaville default or from location)
+    {base_lat, base_long} = case current_location do
+      nil -> {38.3566, -121.9877}
+      loc -> {loc.center_lat, loc.center_long}
+    end
+
+    # Get location_id for NPCs
+    vacaville_id = current_location && current_location.id
+
+    # Initialize with demo NPCs at fixed positions (scene coords are meters from center)
+    # NPCs are placed near Vacaville's center
     npcs = %{
       "npc_alice" => %{
         id: "npc_alice",
@@ -171,6 +192,9 @@ defmodule Wepublic.MapWorld do
         display_name: "Alice",
         color: "#d94a8a",
         position: %{x: 8.0, z: 5.0},
+        lat: base_lat + (5.0 / @meters_per_degree_lat),
+        long: base_long + (8.0 / @meters_per_degree_long),
+        location_id: vacaville_id,
         verification_level: 2,
         has_products: true
       },
@@ -181,6 +205,9 @@ defmodule Wepublic.MapWorld do
         display_name: "Bob",
         color: "#8ad94a",
         position: %{x: 15.0, z: -8.0},
+        lat: base_lat + (-8.0 / @meters_per_degree_lat),
+        long: base_long + (15.0 / @meters_per_degree_long),
+        location_id: vacaville_id,
         verification_level: 1,
         has_products: false
       },
@@ -191,6 +218,9 @@ defmodule Wepublic.MapWorld do
         display_name: "Carol",
         color: "#d9a84a",
         position: %{x: -12.0, z: 10.0},
+        lat: base_lat + (10.0 / @meters_per_degree_lat),
+        long: base_long + (-12.0 / @meters_per_degree_long),
+        location_id: vacaville_id,
         verification_level: 0,
         has_products: false
       }
@@ -225,8 +255,41 @@ defmodule Wepublic.MapWorld do
       {:reply, {:ok, state.entities[user_id]}, state}
     else
       Logger.warning("JOIN: #{user_id} with meta=#{inspect(meta)}")
-      # Assign spawn position
-      {spawn_x, spawn_z} = Enum.at(@spawn_positions, rem(state.spawn_index, length(@spawn_positions)))
+
+      # Try to load user's saved location from database
+      {spawn_location, saved_lat, saved_long} = load_user_saved_location(user_id, state.current_location)
+
+      # Assign spawn position offset (meters from location center)
+      {offset_x, offset_z} = Enum.at(@spawn_positions, rem(state.spawn_index, length(@spawn_positions)))
+
+      # Use saved position or calculate from location center
+      {lat, long, location_id} = case {saved_lat, saved_long, spawn_location} do
+        {lat, long, loc} when not is_nil(lat) and not is_nil(long) and not is_nil(loc) ->
+          # User has saved position - use it
+          {lat, long, loc.id}
+        _ ->
+          # No saved position - spawn at default location
+          {base_lat, base_long} = case spawn_location do
+            nil -> {38.3566, -121.9877}  # Vacaville default
+            loc -> {loc.center_lat, loc.center_long}
+          end
+          loc_id = spawn_location && spawn_location.id
+          {
+            base_lat + (offset_z / @meters_per_degree_lat),
+            base_long + (offset_x / @meters_per_degree_long),
+            loc_id
+          }
+      end
+
+      # Calculate scene position relative to their location center
+      {scene_x, scene_z} = case spawn_location do
+        nil -> {offset_x * 1.0, offset_z * 1.0}
+        loc ->
+          {
+            (long - loc.center_long) * @meters_per_degree_long,
+            (lat - loc.center_lat) * @meters_per_degree_lat
+          }
+      end
 
       entity = %{
         id: user_id,
@@ -234,7 +297,10 @@ defmodule Wepublic.MapWorld do
         name: meta[:name] || meta[:display_name] || "Anonymous",
         display_name: meta[:display_name] || meta[:name] || "Anonymous",
         color: meta[:color] || meta[:avatar_color] || random_color(),
-        position: %{x: spawn_x * 1.0, z: spawn_z * 1.0},
+        position: %{x: scene_x, z: scene_z},
+        lat: lat,
+        long: long,
+        location_id: location_id,
         verification_level: meta[:verification_level] || 0,
         has_products: meta[:has_products] || false,
         connections: meta[:connections] || []
@@ -243,7 +309,7 @@ defmodule Wepublic.MapWorld do
       new_entities = Map.put(state.entities, user_id, entity)
       new_state = %{state | entities: new_entities, spawn_index: state.spawn_index + 1}
 
-      Logger.warning("JOIN: #{user_id} at position #{inspect(entity.position)}, total entities: #{map_size(new_entities)}")
+      Logger.warning("JOIN: #{user_id} at lat/long #{lat}, #{long}, total entities: #{map_size(new_entities)}")
 
       broadcast_update(new_entities)
 
@@ -254,6 +320,14 @@ defmodule Wepublic.MapWorld do
   @impl true
   def handle_call(:get_entities, _from, state) do
     {:reply, state.entities, state}
+  end
+
+  @impl true
+  def handle_call({:get_entities_at_location, location_id}, _from, state) do
+    entities_at_location = state.entities
+    |> Enum.filter(fn {_id, ent} -> ent[:location_id] == location_id end)
+    |> Map.new()
+    {:reply, entities_at_location, state}
   end
 
   @impl true
@@ -288,7 +362,7 @@ defmodule Wepublic.MapWorld do
         {:reply, {:error, :location_not_found}, state}
 
       location ->
-        Logger.warning("TRAVEL: #{user_id} traveling to #{location.name}")
+        Logger.warning("TRAVEL: #{user_id} traveling to #{location.name} (#{location.center_lat}, #{location.center_long})")
 
         # Update user's position to spawn at location center
         case Map.get(state.entities, user_id) do
@@ -296,24 +370,33 @@ defmodule Wepublic.MapWorld do
             {:reply, {:error, :user_not_found}, state}
 
           entity ->
-            # Spawn at center (0, 0) of new location
-            {spawn_x, spawn_z} = {0.0, 0.0}
-            updated_entity = %{entity | position: %{x: spawn_x, z: spawn_z}}
-            new_entities = Map.put(state.entities, user_id, updated_entity)
+            old_location_id = entity[:location_id]
 
-            # Load objects for new location
-            world_objects = load_world_objects(location)
+            # User moves to the destination's lat/long (with small offset for variety)
+            {offset_x, offset_z} = Enum.at(@spawn_positions, rem(state.spawn_index, length(@spawn_positions)))
+            new_lat = location.center_lat + (offset_z / @meters_per_degree_lat)
+            new_long = location.center_long + (offset_x / @meters_per_degree_long)
+
+            # Persist location to database for real users
+            persist_user_location(user_id, new_lat, new_long, location.id)
+
+            # Update only the traveling user's entity
+            updated_entity = %{entity |
+              lat: new_lat,
+              long: new_long,
+              position: %{x: offset_x * 1.0, z: offset_z * 1.0},
+              location_id: location.id
+            }
+            new_entities = Map.put(state.entities, user_id, updated_entity)
 
             new_state = %{state |
               entities: new_entities,
-              current_location: location,
-              world_objects: world_objects,
-              movement_targets: Map.delete(state.movement_targets, user_id)
+              movement_targets: Map.delete(state.movement_targets, user_id),
+              spawn_index: state.spawn_index + 1
             }
 
-            # Broadcast location change to all subscribers
-            broadcast_location_change(location, world_objects)
-            broadcast_update(new_entities)
+            # Broadcast that this user traveled (others see them disappear/appear)
+            broadcast_user_traveled(user_id, old_location_id, location.id)
 
             {:reply, {:ok, location}, new_state}
         end
@@ -323,9 +406,11 @@ defmodule Wepublic.MapWorld do
   @impl true
   def handle_call({:place_object, user_id, attrs}, _from, state) do
     require Logger
+    Logger.warning("PLACE_OBJECT: user=#{user_id}, current_location=#{inspect(state.current_location && state.current_location.id)}, attrs=#{inspect(attrs)}")
 
     case state.current_location do
       nil ->
+        Logger.error("PLACE_OBJECT failed: no current location set")
         {:reply, {:error, :no_location}, state}
 
       location ->
@@ -412,6 +497,12 @@ defmodule Wepublic.MapWorld do
         {:noreply, state}
 
       entity ->
+        # Get current location center for lat/long calculations
+        {center_lat, center_long} = case state.current_location do
+          nil -> {38.3566, -121.9877}
+          loc -> {loc.center_lat, loc.center_long}
+        end
+
         case direction do
           {:to, target_x, target_z} ->
             # Set movement target - will be processed by tick
@@ -422,7 +513,10 @@ defmodule Wepublic.MapWorld do
           dir when dir in [:up, :down, :left, :right] ->
             # Immediate directional movement - clear any target
             new_position = calculate_new_position(entity.position, direction)
-            updated_entity = %{entity | position: new_position}
+            # Update lat/long based on new scene position
+            new_lat = center_lat + (new_position.z / @meters_per_degree_lat)
+            new_long = center_long + (new_position.x / @meters_per_degree_long)
+            updated_entity = %{entity | position: new_position, lat: new_lat, long: new_long}
             new_entities = Map.put(state.entities, user_id, updated_entity)
             new_targets = Map.delete(state.movement_targets, user_id)
 
@@ -439,6 +533,12 @@ defmodule Wepublic.MapWorld do
 
   @impl true
   def handle_info(:tick, state) do
+    # Get current location center for lat/long calculations
+    {center_lat, center_long} = case state.current_location do
+      nil -> {38.3566, -121.9877}
+      loc -> {loc.center_lat, loc.center_long}
+    end
+
     # Process all movement targets
     {new_entities, new_targets, updates} =
       Enum.reduce(state.movement_targets, {state.entities, state.movement_targets, []}, fn
@@ -463,7 +563,10 @@ defmodule Wepublic.MapWorld do
                   x: entity.position.x + dx * ratio,
                   z: entity.position.z + dz * ratio
                 }
-                updated_entity = %{entity | position: new_position}
+                # Update lat/long based on new scene position
+                new_lat = center_lat + (new_position.z / @meters_per_degree_lat)
+                new_long = center_long + (new_position.x / @meters_per_degree_long)
+                updated_entity = %{entity | position: new_position, lat: new_lat, long: new_long}
                 new_entities = Map.put(entities, user_id, updated_entity)
 
                 {new_entities, targets, [{user_id, new_position} | updates]}
@@ -526,8 +629,8 @@ defmodule Wepublic.MapWorld do
     PubSub.broadcast(@pubsub, @topic, {:position_update, user_id, position})
   end
 
-  defp broadcast_location_change(location, world_objects) do
-    PubSub.broadcast(@pubsub, @topic, {:location_changed, location, Map.values(world_objects)})
+  defp broadcast_user_traveled(user_id, from_location_id, to_location_id) do
+    PubSub.broadcast(@pubsub, @topic, {:user_traveled, user_id, from_location_id, to_location_id})
   end
 
   defp broadcast_object_placed(object) do
@@ -547,7 +650,53 @@ defmodule Wepublic.MapWorld do
   end
 
   defp random_color do
-    colors = ["#4a90d9", "#d94a8a", "#8ad94a", "#d9a84a", "#9a4ad9", "#4ad9d9"]
+    colors = ["#4a90d9", "#d94a8a", "#8ad94a", "#9a4ad9", "#4ad9d9"]
     Enum.random(colors)
+  end
+
+  # Persist user location to database (async, non-blocking)
+  defp persist_user_location(user_id, lat, long, location_id) do
+    case user_id do
+      "user_" <> id_str ->
+        Task.start(fn ->
+          case Integer.parse(id_str) do
+            {id, _} ->
+              case Wepublic.Repo.get(Wepublic.Accounts.User, id) do
+                nil -> :ok
+                user -> Geo.update_user_position(user, lat, long, location_id)
+              end
+            :error -> :ok
+          end
+        end)
+      _ ->
+        # NPCs or anonymous users don't persist
+        :ok
+    end
+  end
+
+  # Load user's saved location from database
+  defp load_user_saved_location(user_id, default_location) do
+    case user_id do
+      "user_" <> id_str ->
+        case Integer.parse(id_str) do
+          {id, _} ->
+            case Wepublic.Repo.get(Wepublic.Accounts.User, id) do
+              nil ->
+                {default_location, nil, nil}
+              user ->
+                location = if user.last_location_id do
+                  Geo.get_location(user.last_location_id)
+                else
+                  default_location
+                end
+                {location || default_location, user.position_lat, user.position_long}
+            end
+          :error ->
+            {default_location, nil, nil}
+        end
+      _ ->
+        # NPCs or anonymous users use default
+        {default_location, nil, nil}
+    end
   end
 end

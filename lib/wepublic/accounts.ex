@@ -347,11 +347,15 @@ defmodule Wepublic.Accounts do
   Checks if two users are connected (bidirectional).
   """
   def connected?(%User{} = user1, %User{} = user2) do
+    connected?(user1.id, user2.id)
+  end
+
+  def connected?(user_id1, user_id2) when is_integer(user_id1) and is_integer(user_id2) do
     query =
       from c in UserConnection,
         where:
-          ((c.user_id == ^user1.id and c.connected_user_id == ^user2.id) or
-             (c.user_id == ^user2.id and c.connected_user_id == ^user1.id)) and
+          ((c.user_id == ^user_id1 and c.connected_user_id == ^user_id2) or
+             (c.user_id == ^user_id2 and c.connected_user_id == ^user_id1)) and
             c.status == "accepted"
 
     Repo.exists?(query)

@@ -6,6 +6,7 @@ defmodule WepublicWeb.MapLive do
   alias Wepublic.Accounts.User
   alias Wepublic.MapWorld
   alias Wepublic.Geo
+  alias Wepublic.Interactions
 
   @impl true
   def mount(_params, _session, socket) do
@@ -17,29 +18,44 @@ defmodule WepublicWeb.MapLive do
     my_user_id = get_my_user_id(current_user)
     connections = get_user_connections(current_user)
 
-    world_entities =
+    {my_location, world_entities, world_objects} =
       if connected?(socket) do
         # Subscribe to presence and world updates
         Presence.subscribe("map")
         Presence.track_user(socket, "map")
         MapWorld.subscribe()
 
-        # Join the world - server assigns spawn position
-        # join/2 is a call, so it returns after the entity is added
-        user_meta = build_user_meta(current_user, connections)
-        MapWorld.join(my_user_id, user_meta)
+        # Ensure capabilities are initialized for logged-in users
+        # and subscribe to message notifications
+        if current_user do
+          Interactions.ensure_capabilities(current_user)
+          Interactions.subscribe_to_messages(current_user.id)
+        end
 
-        # Now get all entities (including ourselves)
-        MapWorld.get_entities()
+        # Join the world - server assigns spawn position and returns entity with location_id
+        user_meta = build_user_meta(current_user, connections)
+        {:ok, my_entity} = MapWorld.join(my_user_id, user_meta)
+
+        # Get the user's location from the entity (loaded from DB or default)
+        my_location_id = my_entity[:location_id]
+        location = if my_location_id, do: Geo.get_location(my_location_id), else: MapWorld.get_current_location()
+
+        # Get only entities at my location
+        entities_at_location = if my_location_id do
+          MapWorld.get_entities_at_location(my_location_id)
+        else
+          MapWorld.get_entities()
+        end
+
+        # Get objects at my location
+        objects = if my_location_id, do: Geo.list_objects_at_location(my_location_id), else: []
+
+        {location, entities_at_location, objects}
       else
-        %{}
+        {nil, %{}, []}
       end
 
     online_users = Presence.list_users("map")
-
-    # Get current location from MapWorld
-    current_location = MapWorld.get_current_location()
-    world_objects = if connected?(socket), do: MapWorld.get_objects(), else: []
 
     socket =
       socket
@@ -54,7 +70,7 @@ defmodule WepublicWeb.MapLive do
       |> assign(:my_user_id, my_user_id)
       |> assign(:world_entities, world_entities)
       |> assign(:show_onboarding_prompt, should_show_onboarding?(current_user))
-      |> assign(:current_location, current_location)
+      |> assign(:current_location, my_location)
       |> assign(:world_objects, world_objects)
       |> assign(:show_travel_modal, false)
       |> assign(:travel_search, "")
@@ -62,6 +78,15 @@ defmodule WepublicWeb.MapLive do
       |> assign(:show_place_mode, false)
       |> assign(:place_object_type, "pin")
       |> assign(:place_object_color, "#4a90d9")
+      # Conversation state
+      |> assign(:active_conversation, nil)
+      |> assign(:conversation_messages, [])
+      |> assign(:show_conversation_panel, false)
+      |> assign(:message_input, "")
+      |> assign(:available_interactions, [])
+      |> assign(:user_conversations, load_user_conversations(current_user))
+      |> assign(:unread_conversations, MapSet.new())
+      |> assign(:show_conversations_drawer, false)
 
     {:ok, socket}
   end
@@ -149,6 +174,12 @@ defmodule WepublicWeb.MapLive do
       (not User.did_verified?(user) or not User.feed_verified?(user))
   end
 
+  defp load_user_conversations(nil), do: []
+
+  defp load_user_conversations(user) do
+    Interactions.list_user_conversations(user.id)
+  end
+
   @impl true
   def handle_info(%Phoenix.Socket.Broadcast{event: "presence_state", payload: %{count: count}}, socket) do
     online_users = Presence.list_users("map")
@@ -177,39 +208,92 @@ defmodule WepublicWeb.MapLive do
   end
 
   # Handle world state updates from MapWorld GenServer
+  # Filter to only show entities at my current location
   def handle_info({:world_update, entities}, socket) do
     require Logger
-    entity_ids = Map.keys(entities)
-    Logger.warning("WORLD_UPDATE: my_user_id=#{socket.assigns.my_user_id}, entity_ids=#{inspect(entity_ids)}")
+    my_location_id = socket.assigns.current_location && socket.assigns.current_location.id
+
+    # Filter entities to only those at my location
+    entities_at_location = if my_location_id do
+      entities
+      |> Enum.filter(fn {_id, ent} -> ent[:location_id] == my_location_id end)
+      |> Map.new()
+    else
+      entities
+    end
+
+    entity_ids = Map.keys(entities_at_location)
+    Logger.warning("WORLD_UPDATE: my_user_id=#{socket.assigns.my_user_id}, my_location=#{my_location_id}, entities_at_location=#{inspect(entity_ids)}")
 
     {:noreply,
      socket
-     |> assign(:world_entities, entities)
-     |> push_event("world_update", %{entities: entities_to_list(entities, socket.assigns.my_user_id)})}
+     |> assign(:world_entities, entities_at_location)
+     |> push_event("world_update", %{entities: entities_to_list(entities_at_location, socket.assigns.my_user_id)})}
   end
 
   # Handle position updates from MapWorld GenServer
-  # Send ALL position updates to client (including our own) so client stays in sync with server
+  # Only send position updates for users at my location
   def handle_info({:position_update, user_id, position}, socket) do
     require Logger
-    Logger.warning("POSITION_UPDATE: sending to client, user_id=#{user_id}, my_user_id=#{socket.assigns.my_user_id}")
+    my_location_id = socket.assigns.current_location && socket.assigns.current_location.id
 
-    {:noreply, push_event(socket, "user_position", %{user_id: user_id, position: position})}
+    # Check if this user is at my location
+    entity_at_my_location = case socket.assigns.world_entities[user_id] do
+      nil -> false
+      entity -> entity[:location_id] == my_location_id
+    end
+
+    if entity_at_my_location do
+      Logger.warning("POSITION_UPDATE: sending to client, user_id=#{user_id}, my_user_id=#{socket.assigns.my_user_id}")
+      {:noreply, push_event(socket, "user_position", %{user_id: user_id, position: position})}
+    else
+      # User is at a different location - ignore their position update
+      {:noreply, socket}
+    end
   end
 
-  # Handle location change from MapWorld (when someone travels)
-  def handle_info({:location_changed, location, objects}, socket) do
+  # Handle user traveled event - someone changed locations
+  def handle_info({:user_traveled, user_id, _from_location_id, to_location_id}, socket) do
     require Logger
-    Logger.warning("LOCATION_CHANGED: #{location.name}")
+    my_user_id = socket.assigns.my_user_id
+    my_location_id = socket.assigns.current_location && socket.assigns.current_location.id
 
-    {:noreply,
-     socket
-     |> assign(:current_location, location)
-     |> assign(:world_objects, objects)
-     |> push_event("location_changed", %{
-       location: serialize_location(location),
-       objects: Enum.map(objects, &serialize_object/1)
-     })}
+    cond do
+      # I'm the one who traveled - update my view
+      user_id == my_user_id ->
+        location = Geo.get_location(to_location_id)
+        objects = Geo.list_objects_at_location(to_location_id)
+
+        # Get entities at my new location
+        all_entities = MapWorld.get_entities()
+        entities_at_location = all_entities
+        |> Enum.filter(fn {_id, ent} -> ent[:location_id] == to_location_id end)
+        |> Map.new()
+
+        Logger.warning("TRAVEL: I (#{user_id}) arrived at #{location.name}")
+
+        {:noreply,
+         socket
+         |> assign(:current_location, location)
+         |> assign(:world_objects, objects)
+         |> assign(:world_entities, entities_at_location)
+         |> push_event("location_changed", %{
+           location: serialize_location(location),
+           objects: Enum.map(objects, &serialize_object/1),
+           entities: entities_to_list(entities_at_location, my_user_id)
+         })}
+
+      # Someone else traveled - show them appearing/disappearing
+      to_location_id == my_location_id ->
+        # They arrived at my location - show appear animation
+        Logger.warning("TRAVEL: #{user_id} arrived at my location")
+        {:noreply, push_event(socket, "user_appeared", %{user_id: user_id})}
+
+      true ->
+        # They left my location or traveled elsewhere - show disappear animation
+        Logger.warning("TRAVEL: #{user_id} left (traveled to location #{to_location_id})")
+        {:noreply, push_event(socket, "user_disappeared", %{user_id: user_id})}
+    end
   end
 
   # Handle object placement
@@ -232,6 +316,30 @@ defmodule WepublicWeb.MapLive do
      |> push_event("object_updated", %{object: serialize_object(object)})}
   end
 
+  # Handle incoming message notification
+  def handle_info({:new_message, conversation_id, message}, socket) do
+    active_conv = socket.assigns.active_conversation
+
+    socket =
+      if active_conv && active_conv.id == conversation_id do
+        # Add message to active conversation
+        socket
+        |> update(:conversation_messages, &(&1 ++ [message]))
+      else
+        # Mark conversation as unread and notify 3D scene
+        sender_map_id = "user_#{message.sender_id}"
+
+        socket
+        |> update(:unread_conversations, &MapSet.put(&1, conversation_id))
+        |> push_event("user_has_message", %{user_id: sender_map_id, has_message: true})
+      end
+
+    # Refresh conversations list
+    socket = assign(socket, :user_conversations, load_user_conversations(socket.assigns.current_user))
+
+    {:noreply, socket}
+  end
+
   @impl true
   def handle_event("toggle_drawer", _, socket) do
     {:noreply, assign(socket, :drawer_open, not socket.assigns.drawer_open)}
@@ -241,13 +349,61 @@ defmodule WepublicWeb.MapLive do
     {:noreply, assign(socket, :drawer_open, false)}
   end
 
+  def handle_event("toggle_conversations_drawer", _, socket) do
+    {:noreply, assign(socket, :show_conversations_drawer, not socket.assigns.show_conversations_drawer)}
+  end
+
+  def handle_event("close_conversations_drawer", _, socket) do
+    {:noreply, assign(socket, :show_conversations_drawer, false)}
+  end
+
+  def handle_event("open_conversation", %{"id" => id_str}, socket) do
+    conversation_id = String.to_integer(id_str)
+    conversation = Interactions.get_conversation(conversation_id)
+
+    if conversation do
+      messages = Interactions.list_messages(conversation.id)
+
+      # Mark as read - remove from unread set
+      unread = MapSet.delete(socket.assigns.unread_conversations, conversation_id)
+
+      # Clear message indicator for the other participant(s)
+      socket = Enum.reduce(conversation.participants, socket, fn p, acc ->
+        if p.user_id != socket.assigns.current_user.id do
+          push_event(acc, "user_has_message", %{user_id: "user_#{p.user_id}", has_message: false})
+        else
+          acc
+        end
+      end)
+
+      {:noreply,
+       socket
+       |> assign(:active_conversation, conversation)
+       |> assign(:conversation_messages, messages)
+       |> assign(:show_conversation_panel, true)
+       |> assign(:show_conversations_drawer, false)
+       |> assign(:unread_conversations, unread)}
+    else
+      {:noreply, put_flash(socket, :error, "Conversation not found")}
+    end
+  end
+
   def handle_event("user_clicked", %{"user_id" => user_id}, socket) do
     # Find the user data from the clicked user
     user_data = find_user_by_id(socket.assigns, user_id)
+    current_user = socket.assigns.current_user
+
+    # Compute available interactions
+    available_interactions = if current_user && user_data && user_data.numeric_id do
+      Interactions.available_interactions(current_user.id, user_data.numeric_id)
+    else
+      []
+    end
 
     {:noreply,
      socket
      |> assign(:selected_user, user_data)
+     |> assign(:available_interactions, available_interactions)
      |> assign(:show_user_modal, true)}
   end
 
@@ -347,6 +503,8 @@ defmodule WepublicWeb.MapLive do
   end
 
   def handle_event("place_object", %{"x" => x, "z" => z}, socket) do
+    require Logger
+
     attrs = %{
       object_type: socket.assigns.place_object_type,
       position_x: x,
@@ -354,12 +512,145 @@ defmodule WepublicWeb.MapLive do
       color: socket.assigns.place_object_color
     }
 
+    Logger.warning("PLACE_OBJECT event: attrs=#{inspect(attrs)}")
+
     case MapWorld.place_object(socket.assigns.my_user_id, attrs) do
-      {:ok, _object} ->
+      {:ok, object} ->
+        Logger.warning("PLACE_OBJECT success: id=#{object.id}")
         {:noreply, socket}
 
-      {:error, _reason} ->
+      {:error, reason} ->
+        Logger.error("PLACE_OBJECT failed: #{inspect(reason)}")
         {:noreply, put_flash(socket, :error, "Could not place object")}
+    end
+  end
+
+  # ============================================================================
+  # Interaction Events
+  # ============================================================================
+
+  def handle_event("start_chat", %{"user_id" => user_id_str}, socket) do
+    current_user = socket.assigns.current_user
+
+    if current_user do
+      other_user_id = String.to_integer(user_id_str)
+
+      case Interactions.start_chat(current_user.id, other_user_id) do
+        {:ok, conversation} ->
+          messages = Interactions.list_messages(conversation.id)
+
+          # Mark as read and clear indicator
+          unread = MapSet.delete(socket.assigns.unread_conversations, conversation.id)
+
+          {:noreply,
+           socket
+           |> assign(:active_conversation, conversation)
+           |> assign(:conversation_messages, messages)
+           |> assign(:show_conversation_panel, true)
+           |> assign(:show_user_modal, false)
+           |> assign(:unread_conversations, unread)
+           |> push_event("user_has_message", %{user_id: "user_#{other_user_id}", has_message: false})}
+
+        {:error, _reason} ->
+          {:noreply, put_flash(socket, :error, "Could not start chat")}
+      end
+    else
+      {:noreply,
+       socket
+       |> put_flash(:error, "You must be logged in to chat")
+       |> push_navigate(to: ~p"/users/log-in")}
+    end
+  end
+
+  def handle_event("start_conversation", _, socket) do
+    current_user = socket.assigns.current_user
+    current_location = socket.assigns.current_location
+
+    if current_user do
+      attrs = %{
+        location_id: current_location && current_location.id,
+        visibility: "local"
+      }
+
+      case Interactions.start_conversation(current_user.id, attrs) do
+        {:ok, conversation} ->
+          {:noreply,
+           socket
+           |> assign(:active_conversation, conversation)
+           |> assign(:conversation_messages, [])
+           |> assign(:show_conversation_panel, true)}
+
+        {:error, _reason} ->
+          {:noreply, put_flash(socket, :error, "Could not start conversation")}
+      end
+    else
+      {:noreply, put_flash(socket, :error, "You must be logged in to start a conversation")}
+    end
+  end
+
+  def handle_event("start_collaboration", %{"topic" => topic}, socket) do
+    current_user = socket.assigns.current_user
+
+    if current_user && String.trim(topic) != "" do
+      case Interactions.start_collaboration(current_user.id, topic) do
+        {:ok, conversation} ->
+          {:noreply,
+           socket
+           |> assign(:active_conversation, conversation)
+           |> assign(:conversation_messages, [])
+           |> assign(:show_conversation_panel, true)}
+
+        {:error, _reason} ->
+          {:noreply, put_flash(socket, :error, "Could not start collaboration")}
+      end
+    else
+      {:noreply, socket}
+    end
+  end
+
+  def handle_event("send_message", %{"content" => content}, socket) do
+    current_user = socket.assigns.current_user
+    conversation = socket.assigns.active_conversation
+
+    if current_user && conversation && String.trim(content) != "" do
+      case Interactions.send_message(conversation.id, current_user.id, content) do
+        {:ok, message} ->
+          {:noreply,
+           socket
+           |> update(:conversation_messages, &(&1 ++ [message]))
+           |> assign(:message_input, "")
+           |> push_event("message_sent", %{})}
+
+        {:error, _reason} ->
+          {:noreply, put_flash(socket, :error, "Could not send message")}
+      end
+    else
+      {:noreply, socket}
+    end
+  end
+
+  def handle_event("close_conversation", _, socket) do
+    {:noreply,
+     socket
+     |> assign(:show_conversation_panel, false)
+     |> assign(:active_conversation, nil)
+     |> assign(:conversation_messages, [])}
+  end
+
+  def handle_event("load_conversation", %{"id" => id_str}, socket) do
+    conversation_id = String.to_integer(id_str)
+    conversation = Interactions.get_conversation(conversation_id)
+
+    if conversation do
+      messages = Interactions.list_messages(conversation.id)
+
+      {:noreply,
+       socket
+       |> assign(:active_conversation, conversation)
+       |> assign(:conversation_messages, messages)
+       |> assign(:show_conversation_panel, true)}
+    else
+      {:noreply, put_flash(socket, :error, "Conversation not found")}
     end
   end
 
@@ -587,6 +878,7 @@ defmodule WepublicWeb.MapLive do
       data-users={Jason.encode!(@map_users)}
       data-current-user-id={@my_user_id}
       data-connections={@connection_ids_json}
+      data-location={Jason.encode!(serialize_location(@current_location))}
       class="w-full h-screen relative z-0"
     >
     </div>
@@ -616,6 +908,20 @@ defmodule WepublicWeb.MapLive do
         class="w-full text-left text-blue-400 hover:text-blue-300 text-xs py-1"
       >
         Connections ({length(@connections)}) →
+      </button>
+      <button
+        :if={@current_user}
+        phx-click="toggle_conversations_drawer"
+        class="w-full text-left text-purple-400 hover:text-purple-300 text-xs py-1 flex items-center gap-2"
+      >
+        <span>Messages ({length(@user_conversations)})</span>
+        <span
+          :if={MapSet.size(@unread_conversations) > 0}
+          class="bg-red-500 text-white text-xs rounded-full px-1.5 py-0.5 min-w-[18px] text-center"
+        >
+          {MapSet.size(@unread_conversations)}
+        </span>
+        <span>→</span>
       </button>
       <div
         id="figure-list"
@@ -652,11 +958,27 @@ defmodule WepublicWeb.MapLive do
       current_user={@current_user}
     />
 
+    <.conversations_drawer
+      :if={@current_user}
+      open={@show_conversations_drawer}
+      conversations={@user_conversations}
+      unread={@unread_conversations}
+      current_user={@current_user}
+    />
+
     <.user_profile_modal
       :if={@show_user_modal && @selected_user}
       user={@selected_user}
       current_user={@current_user}
       connections={@connections}
+      available_interactions={@available_interactions}
+    />
+
+    <.conversation_panel
+      :if={@show_conversation_panel && @active_conversation}
+      conversation={@active_conversation}
+      messages={@conversation_messages}
+      current_user={@current_user}
     />
 
     <.travel_modal
@@ -782,6 +1104,164 @@ defmodule WepublicWeb.MapLive do
     >
     </div>
     """
+  end
+
+  defp conversations_drawer(assigns) do
+    ~H"""
+    <div
+      class={[
+        "fixed top-0 right-0 h-full w-80 bg-gray-900 shadow-xl transform transition-transform duration-300 z-50",
+        if(@open, do: "translate-x-0", else: "translate-x-full")
+      ]}
+    >
+      <div class="p-4 border-b border-gray-700">
+        <div class="flex items-center justify-between">
+          <h2 class="text-white font-bold text-lg">Messages</h2>
+          <button
+            phx-click="close_conversations_drawer"
+            class="text-gray-400 hover:text-white"
+          >
+            ✕
+          </button>
+        </div>
+      </div>
+
+      <div class="overflow-y-auto h-full pb-20">
+        <%= if length(@conversations) == 0 do %>
+          <div class="p-4 text-gray-400 text-center">
+            <p class="mb-2">No conversations yet</p>
+            <p class="text-sm">
+              Click on another user and start a chat to begin messaging.
+            </p>
+          </div>
+        <% else %>
+          <div class="divide-y divide-gray-700">
+            <%= for conv <- @conversations do %>
+              <.conversation_item
+                conv={conv}
+                is_unread={MapSet.member?(@unread, conv.id)}
+                current_user={@current_user}
+              />
+            <% end %>
+          </div>
+        <% end %>
+      </div>
+    </div>
+
+    <div
+      :if={@open}
+      phx-click="close_conversations_drawer"
+      class="fixed inset-0 bg-black/50 z-40"
+    >
+    </div>
+    """
+  end
+
+  defp conversation_item(assigns) do
+    # Get other participants for display
+    other_participants =
+      assigns.conv.participants
+      |> Enum.reject(fn p -> p.user_id == assigns.current_user.id end)
+      |> Enum.map(fn p -> p.user end)
+      |> Enum.filter(& &1)
+
+    title =
+      case assigns.conv.type do
+        "chat" ->
+          other_participants
+          |> Enum.map(fn u -> u.display_name || "User" end)
+          |> Enum.join(", ")
+
+        "conversation" ->
+          assigns.conv.title || "Conversation"
+
+        "collaborate" ->
+          assigns.conv.topic || "Collaboration"
+
+        _ ->
+          "Conversation"
+      end
+
+    first_other = List.first(other_participants)
+
+    assigns =
+      assigns
+      |> assign(:title, title)
+      |> assign(:first_other, first_other)
+      |> assign(:other_participants, other_participants)
+
+    ~H"""
+    <div
+      class={[
+        "p-4 hover:bg-gray-800 cursor-pointer",
+        if(@is_unread, do: "bg-purple-900/30", else: "")
+      ]}
+      phx-click="open_conversation"
+      phx-value-id={@conv.id}
+    >
+      <div class="flex items-center gap-3">
+        <div class="relative">
+          <%= if @first_other do %>
+            <div
+              class="w-10 h-10 rounded-full flex items-center justify-center text-white font-bold"
+              style={"background-color: #{@first_other.avatar_color || "#4a90d9"}"}
+            >
+              {String.first(@first_other.display_name || "?")}
+            </div>
+          <% else %>
+            <div class="w-10 h-10 rounded-full flex items-center justify-center text-white font-bold bg-gray-600">
+              ?
+            </div>
+          <% end %>
+          <div
+            :if={@is_unread}
+            class="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full border-2 border-gray-900"
+          >
+          </div>
+        </div>
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-2">
+            <span class={[
+              "font-medium truncate",
+              if(@is_unread, do: "text-white", else: "text-gray-300")
+            ]}>
+              {@title}
+            </span>
+            <span class={[
+              "text-xs px-1.5 py-0.5 rounded",
+              case @conv.type do
+                "chat" -> "bg-purple-600/30 text-purple-400"
+                "conversation" -> "bg-blue-600/30 text-blue-400"
+                "collaborate" -> "bg-green-600/30 text-green-400"
+                _ -> "bg-gray-600/30 text-gray-400"
+              end
+            ]}>
+              {@conv.type}
+            </span>
+          </div>
+          <div class="text-xs text-gray-500 truncate">
+            {format_relative_time(@conv.updated_at)}
+          </div>
+        </div>
+        <div class="text-gray-600">
+          →
+        </div>
+      </div>
+    </div>
+    """
+  end
+
+  defp format_relative_time(datetime) do
+    now = DateTime.utc_now()
+    diff = DateTime.diff(now, datetime, :second)
+
+    cond do
+      diff < 60 -> "just now"
+      diff < 3600 -> "#{div(diff, 60)}m ago"
+      diff < 86400 -> "#{div(diff, 3600)}h ago"
+      diff < 604_800 -> "#{div(diff, 86400)}d ago"
+      true -> Calendar.strftime(datetime, "%b %d")
+    end
   end
 
   defp connection_item(assigns) do
@@ -955,6 +1435,59 @@ defmodule WepublicWeb.MapLive do
               <.verification_level_display level={@user.verification_level} />
             </div>
           </div>
+
+          <%= if !@user.is_demo && @current_user do %>
+            <div class="mt-4 border-t border-gray-700 pt-4">
+              <div class="text-gray-400 text-xs mb-2">Interact</div>
+              <div class="flex flex-wrap gap-2">
+                <%= if "chat" in @available_interactions do %>
+                  <button
+                    phx-click="start_chat"
+                    phx-value-user_id={@user.numeric_id}
+                    class="flex items-center gap-2 bg-purple-600 hover:bg-purple-700 text-white py-2 px-3 rounded-lg transition text-sm"
+                  >
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+                    </svg>
+                    Chat
+                  </button>
+                <% end %>
+
+                <%= if "conversation" in @available_interactions do %>
+                  <button
+                    phx-click="start_conversation"
+                    class="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white py-2 px-3 rounded-lg transition text-sm"
+                  >
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
+                    </svg>
+                    Conversation
+                  </button>
+                <% end %>
+
+                <%= if "collaborate" in @available_interactions do %>
+                  <button
+                    phx-click="start_collaboration"
+                    phx-value-topic="General"
+                    class="flex items-center gap-2 bg-green-600 hover:bg-green-700 text-white py-2 px-3 rounded-lg transition text-sm"
+                  >
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+                    </svg>
+                    Collaborate
+                  </button>
+                <% end %>
+
+                <%= if @available_interactions == [] do %>
+                  <%= if @is_connected do %>
+                    <span class="text-gray-500 text-sm">No interactions available</span>
+                  <% else %>
+                    <span class="text-gray-500 text-sm">Connect to enable chat</span>
+                  <% end %>
+                <% end %>
+              </div>
+            </div>
+          <% end %>
 
           <div class="mt-4 flex gap-3">
             <%= if @user.is_demo do %>
@@ -1186,5 +1719,133 @@ defmodule WepublicWeb.MapLive do
       </div>
     </div>
     """
+  end
+
+  defp conversation_panel(assigns) do
+    # Get other participants' names for display
+    other_participants = assigns.conversation.participants
+    |> Enum.reject(fn p -> p.user_id == assigns.current_user.id end)
+    |> Enum.map(fn p -> p.user.display_name || "User" end)
+
+    title = case assigns.conversation.type do
+      "chat" -> Enum.join(other_participants, ", ")
+      "conversation" -> assigns.conversation.title || "Conversation"
+      "collaborate" -> assigns.conversation.topic || "Collaboration"
+    end
+
+    assigns = assigns
+    |> assign(:title, title)
+    |> assign(:conversation_type, assigns.conversation.type)
+
+    ~H"""
+    <div class="fixed bottom-4 right-4 z-50 w-96 bg-gray-800 rounded-xl shadow-2xl overflow-hidden flex flex-col max-h-[500px]">
+      <div class="p-3 border-b border-gray-700 flex items-center justify-between bg-gray-900">
+        <div class="flex items-center gap-2">
+          <div class={[
+            "w-2 h-2 rounded-full",
+            case @conversation_type do
+              "chat" -> "bg-purple-400"
+              "conversation" -> "bg-blue-400"
+              "collaborate" -> "bg-green-400"
+            end
+          ]}>
+          </div>
+          <span class="text-white font-medium truncate">{@title}</span>
+          <span class="text-gray-500 text-xs">
+            ({String.capitalize(@conversation_type)})
+          </span>
+        </div>
+        <button
+          phx-click="close_conversation"
+          class="text-gray-400 hover:text-white"
+        >
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+          </svg>
+        </button>
+      </div>
+
+      <div
+        id="messages-container"
+        class="flex-1 overflow-y-auto p-3 space-y-3 min-h-[200px] max-h-[300px]"
+        phx-hook="ScrollToBottom"
+      >
+        <%= if @messages == [] do %>
+          <div class="text-center text-gray-500 py-8">
+            No messages yet. Start the conversation!
+          </div>
+        <% else %>
+          <%= for message <- @messages do %>
+            <.message_bubble
+              message={message}
+              is_own={message.sender_id == @current_user.id}
+            />
+          <% end %>
+        <% end %>
+      </div>
+
+      <form
+        phx-submit="send_message"
+        class="p-3 border-t border-gray-700 bg-gray-900"
+      >
+        <div class="flex gap-2">
+          <input
+            type="text"
+            name="content"
+            placeholder="Type a message..."
+            autocomplete="off"
+            class="flex-1 bg-gray-700 text-white rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500"
+          />
+          <button
+            type="submit"
+            class="bg-purple-600 hover:bg-purple-700 text-white px-4 py-2 rounded-lg transition"
+          >
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
+            </svg>
+          </button>
+        </div>
+      </form>
+    </div>
+    """
+  end
+
+  defp message_bubble(assigns) do
+    ~H"""
+    <div class={[
+      "flex",
+      if(@is_own, do: "justify-end", else: "justify-start")
+    ]}>
+      <div class={[
+        "max-w-[80%] rounded-lg px-3 py-2",
+        if(@is_own, do: "bg-purple-600 text-white", else: "bg-gray-700 text-white")
+      ]}>
+        <%= if !@is_own && @message.sender do %>
+          <div class="text-xs text-gray-400 mb-1">
+            {@message.sender.display_name || "User"}
+          </div>
+        <% end %>
+
+        <%= if @message.message_type == "system" do %>
+          <div class="text-xs text-gray-400 italic text-center">
+            {@message.content}
+          </div>
+        <% else %>
+          <div class="text-sm break-words">{@message.content}</div>
+        <% end %>
+
+        <div class={[
+          "text-xs mt-1",
+          if(@is_own, do: "text-purple-200", else: "text-gray-500")
+        ]}>
+          {format_time(@message.inserted_at)}
+        </div>
+      </div>
+    </div>
+    """
+  end
+
+  defp format_time(datetime) do
+    Calendar.strftime(datetime, "%I:%M %p")
   end
 end

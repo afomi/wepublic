@@ -77,6 +77,69 @@ for loc <- locations do
 end
 
 # ============================================================================
+# Seed World Objects for each location
+# ============================================================================
+
+alias Wepublic.Geo.WorldObject
+
+IO.puts("\nSeeding world objects...")
+
+# Get locations by slug for reference
+vacaville = Repo.get_by!(Location, slug: "vacaville-ca")
+san_francisco = Repo.get_by!(Location, slug: "san-francisco-ca")
+vallejo = Repo.get_by!(Location, slug: "vallejo-ca")
+oakland = Repo.get_by!(Location, slug: "oakland-ca")
+sacramento = Repo.get_by!(Location, slug: "sacramento-ca")
+
+# Clear existing world objects to avoid duplicates
+Repo.delete_all(WorldObject)
+
+world_objects_data = [
+  # Vacaville - Farm town theme (green pins, brown cubes)
+  %{location_id: vacaville.id, object_type: "pin", position_x: 0.0, position_z: 0.0, color: "#22c55e", label: "Vacaville Center"},
+  %{location_id: vacaville.id, object_type: "cube", position_x: 5.0, position_z: 3.0, color: "#92400e", label: "Barn"},
+  %{location_id: vacaville.id, object_type: "cube", position_x: -4.0, position_z: 6.0, color: "#92400e", label: "Silo"},
+  %{location_id: vacaville.id, object_type: "pin", position_x: 8.0, position_z: -5.0, color: "#22c55e", label: "Orchard"},
+  %{location_id: vacaville.id, object_type: "pin", position_x: -10.0, position_z: -3.0, color: "#84cc16", label: "Farm Stand"},
+
+  # San Francisco - Urban theme (blue/purple pins, gray cubes)
+  %{location_id: san_francisco.id, object_type: "pin", position_x: 0.0, position_z: 0.0, color: "#f97316", label: "SF Center"},
+  %{location_id: san_francisco.id, object_type: "cube", position_x: 6.0, position_z: 4.0, color: "#64748b", label: "Transamerica"},
+  %{location_id: san_francisco.id, object_type: "cube", position_x: -5.0, position_z: 7.0, color: "#475569", label: "Salesforce Tower"},
+  %{location_id: san_francisco.id, object_type: "cube", position_x: 3.0, position_z: -6.0, color: "#334155", label: "Coit Tower"},
+  %{location_id: san_francisco.id, object_type: "pin", position_x: -8.0, position_z: -4.0, color: "#ec4899", label: "Painted Ladies"},
+  %{location_id: san_francisco.id, object_type: "pin", position_x: 12.0, position_z: 0.0, color: "#f97316", label: "Ferry Building"},
+
+  # Vallejo - Maritime theme (cyan pins, blue cubes)
+  %{location_id: vallejo.id, object_type: "pin", position_x: 0.0, position_z: 0.0, color: "#06b6d4", label: "Vallejo Center"},
+  %{location_id: vallejo.id, object_type: "cube", position_x: 4.0, position_z: 5.0, color: "#0284c7", label: "Mare Island"},
+  %{location_id: vallejo.id, object_type: "pin", position_x: -6.0, position_z: 3.0, color: "#22d3ee", label: "Ferry Terminal"},
+  %{location_id: vallejo.id, object_type: "cube", position_x: 7.0, position_z: -4.0, color: "#0369a1", label: "Shipyard"},
+
+  # Oakland - Industrial theme (yellow pins, orange cubes)
+  %{location_id: oakland.id, object_type: "pin", position_x: 0.0, position_z: 0.0, color: "#eab308", label: "Oakland Center"},
+  %{location_id: oakland.id, object_type: "cube", position_x: 5.0, position_z: 6.0, color: "#ea580c", label: "Port Crane"},
+  %{location_id: oakland.id, object_type: "cube", position_x: -7.0, position_z: 4.0, color: "#c2410c", label: "Container"},
+  %{location_id: oakland.id, object_type: "pin", position_x: 9.0, position_z: -3.0, color: "#fbbf24", label: "Jack London Sq"},
+  %{location_id: oakland.id, object_type: "pin", position_x: -4.0, position_z: -7.0, color: "#f59e0b", label: "Lake Merritt"},
+
+  # Sacramento - Government theme (gold pins, white cubes)
+  %{location_id: sacramento.id, object_type: "pin", position_x: 0.0, position_z: 0.0, color: "#fbbf24", label: "Sacramento Center"},
+  %{location_id: sacramento.id, object_type: "cube", position_x: 3.0, position_z: 5.0, color: "#f5f5f4", label: "Capitol"},
+  %{location_id: sacramento.id, object_type: "cube", position_x: -6.0, position_z: 3.0, color: "#e7e5e4", label: "Tower Bridge"},
+  %{location_id: sacramento.id, object_type: "pin", position_x: 8.0, position_z: -2.0, color: "#d97706", label: "Old Sacramento"},
+  %{location_id: sacramento.id, object_type: "pin", position_x: -3.0, position_z: -6.0, color: "#b45309", label: "Crocker Art"}
+]
+
+for obj_data <- world_objects_data do
+  %WorldObject{}
+  |> WorldObject.changeset(obj_data)
+  |> Repo.insert!()
+end
+
+IO.puts("Seeded #{length(world_objects_data)} world objects across #{length(locations)} locations")
+
+# ============================================================================
 # Seed Users
 # ============================================================================
 

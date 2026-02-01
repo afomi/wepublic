@@ -97,7 +97,7 @@ export function renderNeighborhood(containerId, options = {}) {
 
   // Ground plane
   const groundGeometry = new THREE.PlaneGeometry(200, 200);
-  const groundMaterial = new THREE.MeshStandardMaterial({
+  let groundMaterial = new THREE.MeshStandardMaterial({
     color: 0x3d5c3d,
     roughness: 0.9
   });
@@ -106,6 +106,10 @@ export function renderNeighborhood(containerId, options = {}) {
   ground.receiveShadow = true;
   ground.userData.isGround = true;
   scene.add(ground);
+
+  // Group for location-specific scenery (streets, buildings)
+  const sceneryGroup = new THREE.Group();
+  scene.add(sceneryGroup);
 
   // Seeded random for consistent generation
   function seededRandom(seed) {
@@ -119,36 +123,61 @@ export function renderNeighborhood(containerId, options = {}) {
     return seededRandom(seedCounter);
   }
 
+  // Location-specific themes
+  const locationThemes = {
+    "vacaville-ca": {
+      ground: 0x3d5c3d,        // Green grass (farm)
+      street: 0x555555,        // Light gray roads
+      buildings: [0x8b7355, 0xa0936e, 0x92400e, 0x78350f, 0x654321], // Browns (barns)
+      buildingHeight: { min: 3, max: 6 },  // Low buildings
+      seed: 1000
+    },
+    "san-francisco-ca": {
+      ground: 0x4a4a4a,        // Gray/concrete
+      street: 0x333333,        // Dark roads
+      buildings: [0x64748b, 0x475569, 0x334155, 0x1e293b, 0x94a3b8], // Grays/blues (skyscrapers)
+      buildingHeight: { min: 8, max: 20 }, // Tall buildings
+      seed: 2000
+    },
+    "vallejo-ca": {
+      ground: 0x3d4c5c,        // Blue-gray (maritime)
+      street: 0x444444,
+      buildings: [0x0284c7, 0x0369a1, 0x075985, 0x164e63, 0x155e75], // Blues (waterfront)
+      buildingHeight: { min: 4, max: 10 },
+      seed: 3000
+    },
+    "oakland-ca": {
+      ground: 0x4a4a3d,        // Olive/industrial
+      street: 0x3a3a3a,
+      buildings: [0xea580c, 0xc2410c, 0x9a3412, 0x78350f, 0xfbbf24], // Oranges/industrial
+      buildingHeight: { min: 5, max: 15 },
+      seed: 4000
+    },
+    "sacramento-ca": {
+      ground: 0x4a5c3d,        // Green with yellow tint
+      street: 0x4a4a4a,
+      buildings: [0xf5f5f4, 0xe7e5e4, 0xd6d3d1, 0xfbbf24, 0xf59e0b], // Whites/golds (government)
+      buildingHeight: { min: 4, max: 12 },
+      seed: 5000
+    }
+  };
+
   // Street creation
-  function createStreet(x, z, streetWidth, length, vertical = false) {
+  function createStreet(x, z, streetWidth, length, vertical, color) {
     const streetGeometry = new THREE.PlaneGeometry(
       vertical ? streetWidth : length,
       vertical ? length : streetWidth
     );
     const streetMaterial = new THREE.MeshStandardMaterial({
-      color: 0x444444,
+      color: color,
       roughness: 0.8
     });
     const street = new THREE.Mesh(streetGeometry, streetMaterial);
     street.rotation.x = -Math.PI / 2;
     street.position.set(x, 0.01, z);
     street.receiveShadow = true;
-    street.userData.isGround = true;
     return street;
   }
-
-  // Create neighborhood streets (grid pattern)
-  const streetWidth = 8;
-  const blockSize = 40;
-
-  // Main horizontal streets
-  scene.add(createStreet(0, -blockSize / 2, streetWidth, 180, false));
-  scene.add(createStreet(0, blockSize / 2, streetWidth, 180, false));
-
-  // Vertical streets
-  scene.add(createStreet(-blockSize, 0, streetWidth, 100, true));
-  scene.add(createStreet(0, 0, streetWidth, 100, true));
-  scene.add(createStreet(blockSize, 0, streetWidth, 100, true));
 
   // Building creation
   function createBuilding(x, z, w, d, h, color) {
@@ -161,34 +190,77 @@ export function renderNeighborhood(containerId, options = {}) {
     building.position.set(x, h / 2, z);
     building.castShadow = true;
     building.receiveShadow = true;
-    building.userData.isBuilding = true;
     return building;
   }
 
-  // Seed buildings in blocks
-  const buildingColors = [0x8b7355, 0xa0936e, 0xc4b7a6, 0x9a8b7a, 0xb8a080];
-
-  function seedBlock(centerX, centerZ, seed) {
-    seedCounter = seed;
-    const buildingCount = 3 + Math.floor(random() * 3);
-
-    for (let i = 0; i < buildingCount; i++) {
-      const bx = centerX + (random() - 0.5) * 28;
-      const bz = centerZ + (random() - 0.5) * 28;
-      const bw = 6 + random() * 8;
-      const bd = 6 + random() * 8;
-      const bh = 4 + random() * 8;
-      const color = buildingColors[Math.floor(random() * buildingColors.length)];
-
-      scene.add(createBuilding(bx, bz, bw, bd, bh, color));
+  // Generate scenery for a location
+  function generateScenery(slug) {
+    // Clear existing scenery
+    while (sceneryGroup.children.length > 0) {
+      sceneryGroup.remove(sceneryGroup.children[0]);
     }
+
+    const theme = locationThemes[slug] || locationThemes["vacaville-ca"];
+
+    // Update ground color
+    ground.material.color.setHex(theme.ground);
+
+    // Street dimensions
+    const streetWidth = 8;
+    const blockSize = 40;
+
+    // Create streets
+    sceneryGroup.add(createStreet(0, -blockSize / 2, streetWidth, 180, false, theme.street));
+    sceneryGroup.add(createStreet(0, blockSize / 2, streetWidth, 180, false, theme.street));
+    sceneryGroup.add(createStreet(-blockSize, 0, streetWidth, 100, true, theme.street));
+    sceneryGroup.add(createStreet(0, 0, streetWidth, 100, true, theme.street));
+    sceneryGroup.add(createStreet(blockSize, 0, streetWidth, 100, true, theme.street));
+
+    // Seed buildings in blocks
+    function seedBlock(centerX, centerZ, blockSeed) {
+      seedCounter = blockSeed;
+      const buildingCount = 3 + Math.floor(random() * 4);
+
+      for (let i = 0; i < buildingCount; i++) {
+        const bx = centerX + (random() - 0.5) * 28;
+        const bz = centerZ + (random() - 0.5) * 28;
+        const bw = 5 + random() * 8;
+        const bd = 5 + random() * 8;
+        const bh = theme.buildingHeight.min + random() * (theme.buildingHeight.max - theme.buildingHeight.min);
+        const color = theme.buildings[Math.floor(random() * theme.buildings.length)];
+
+        sceneryGroup.add(createBuilding(bx, bz, bw, bd, bh, color));
+      }
+    }
+
+    // Create 4 blocks with location-specific seed
+    seedBlock(-blockSize / 2, -blockSize, theme.seed + 1);
+    seedBlock(blockSize / 2, -blockSize, theme.seed + 2);
+    seedBlock(-blockSize / 2, blockSize, theme.seed + 3);
+    seedBlock(blockSize / 2, blockSize, theme.seed + 4);
+
+    console.log("[neighborhood] Generated scenery for", slug);
   }
 
-  // Create 4 blocks
-  seedBlock(-blockSize / 2, -blockSize, 1001);
-  seedBlock(blockSize / 2, -blockSize, 1002);
-  seedBlock(-blockSize / 2, blockSize, 1003);
-  seedBlock(blockSize / 2, blockSize, 1004);
+  // Generate initial scenery - use provided location or default to Vacaville
+  const initialSlug = config.initialLocation?.slug || "vacaville-ca";
+  generateScenery(initialSlug);
+
+  // Set initial sky color based on location
+  const initialSkyColor = {
+    "vacaville-ca": 0x1a1a2e,
+    "san-francisco-ca": 0x2e1a1a,
+    "vallejo-ca": 0x1a2e2e,
+    "oakland-ca": 0x2e2e1a,
+    "sacramento-ca": 0x2e1a2e
+  }[initialSlug] || 0x1a1a2e;
+  scene.background = new THREE.Color(initialSkyColor);
+
+  // Set initial origin if provided
+  if (config.initialLocation?.center_lat && config.initialLocation?.center_long) {
+    origin.lat = config.initialLocation.center_lat;
+    origin.long = config.initialLocation.center_long;
+  }
 
   // Default users for development/demo
   const defaultUsers = [
@@ -383,6 +455,82 @@ export function renderNeighborhood(containerId, options = {}) {
     return group;
   }
 
+  // Create conversation indicator (speech bubble)
+  function createConversationIndicator() {
+    const group = new THREE.Group();
+
+    // Speech bubble body (rounded rectangle approximated with sphere + cylinder)
+    const bubbleGeometry = new THREE.SphereGeometry(0.25, 16, 16);
+    const bubbleMaterial = new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.9
+    });
+
+    const bubble = new THREE.Mesh(bubbleGeometry, bubbleMaterial);
+    bubble.scale.set(1.2, 0.8, 0.4);
+    bubble.position.set(0.5, 2.5, 0);
+    group.add(bubble);
+
+    // Tail pointing to head
+    const tailGeometry = new THREE.ConeGeometry(0.08, 0.2, 8);
+    const tail = new THREE.Mesh(tailGeometry, bubbleMaterial);
+    tail.position.set(0.3, 2.3, 0);
+    tail.rotation.z = Math.PI / 4;
+    group.add(tail);
+
+    // Typing dots (three small spheres)
+    const dotGeometry = new THREE.SphereGeometry(0.04, 8, 8);
+    const dotMaterial = new THREE.MeshBasicMaterial({ color: 0x888888 });
+
+    for (let i = 0; i < 3; i++) {
+      const dot = new THREE.Mesh(dotGeometry, dotMaterial.clone());
+      dot.position.set(0.35 + i * 0.1, 2.5, 0.05);
+      dot.userData.dotIndex = i;
+      group.add(dot);
+    }
+
+    group.visible = false;
+    group.userData.isTyping = false;
+    group.userData.inConversation = false;
+
+    return group;
+  }
+
+  // Create message notification indicator (exclamation in circle, pulsing)
+  function createMessageIndicator() {
+    const group = new THREE.Group();
+
+    // Circle background
+    const circleGeometry = new THREE.CircleGeometry(0.2, 16);
+    const circleMaterial = new THREE.MeshBasicMaterial({
+      color: 0xff4444,
+      transparent: true,
+      opacity: 0.9
+    });
+    const circle = new THREE.Mesh(circleGeometry, circleMaterial);
+    circle.position.set(-0.5, 2.5, 0);
+    group.add(circle);
+
+    // Exclamation mark (simple line + dot)
+    const exclamationGeometry = new THREE.BoxGeometry(0.04, 0.15, 0.04);
+    const exclamationMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff });
+    const exclamationLine = new THREE.Mesh(exclamationGeometry, exclamationMaterial);
+    exclamationLine.position.set(-0.5, 2.53, 0.01);
+    group.add(exclamationLine);
+
+    const dotGeometry = new THREE.CircleGeometry(0.03, 8);
+    const dot = new THREE.Mesh(dotGeometry, exclamationMaterial);
+    dot.position.set(-0.5, 2.4, 0.01);
+    group.add(dot);
+
+    group.visible = false;
+    group.userData.hasMessage = false;
+    group.userData.pulsePhase = 0;
+
+    return group;
+  }
+
   // Create movement target indicator
   function createTargetIndicator() {
     const group = new THREE.Group();
@@ -558,10 +706,37 @@ export function renderNeighborhood(containerId, options = {}) {
     addWorldObject(obj);
   }
 
-  // Update location (new location data with boundary)
+  // Location-based sky colors
+  const locationColors = {
+    "vacaville-ca": 0x1a1a2e,      // Dark blue (default)
+    "san-francisco-ca": 0x2e1a1a,  // Dark red
+    "vallejo-ca": 0x1a2e2e,        // Dark cyan
+    "oakland-ca": 0x2e2e1a,        // Dark yellow
+    "sacramento-ca": 0x2e1a2e      // Dark purple
+  };
+
+  // Update location (travel to new location)
   function updateLocation(locationData) {
+    console.log("[neighborhood] updateLocation called:", locationData);
+
+    // Clear all world objects from old location
+    clearAllWorldObjects();
+
+    // Change sky color based on location
+    const skyColor = locationColors[locationData.slug] || 0x1a1a2e;
+    scene.background = new THREE.Color(skyColor);
+
+    // Regenerate scenery (streets, buildings) for new location
+    generateScenery(locationData.slug);
+
+    // Update boundary lines
     if (locationData.bounds_geojson) {
       createBoundaryLines(locationData.bounds_geojson);
+    } else {
+      // Clear boundaries if none
+      while (boundaryGroup.children.length > 0) {
+        boundaryGroup.remove(boundaryGroup.children[0]);
+      }
     }
 
     // Update origin for coordinate conversion
@@ -569,6 +744,27 @@ export function renderNeighborhood(containerId, options = {}) {
       origin.lat = locationData.center_lat;
       origin.long = locationData.center_long;
     }
+
+    // Reset camera to center on origin (viewer will be moved by position update)
+    camera.position.set(camDistance, camDistance, camDistance);
+    camera.lookAt(0, 0, 0);
+    cameraPanTarget = null;
+
+    // Center on viewer figure if it exists
+    if (viewerFigure) {
+      const vx = viewerFigure.position.x;
+      const vz = viewerFigure.position.z;
+      camera.position.set(vx + camDistance, camDistance, vz + camDistance);
+      camera.lookAt(vx, 0, vz);
+    }
+  }
+
+  // Clear all world objects
+  function clearAllWorldObjects() {
+    worldObjectMeshes.forEach((mesh, id) => {
+      worldObjectsGroup.remove(mesh);
+    });
+    worldObjectMeshes.clear();
   }
 
   // Set place mode
@@ -636,6 +832,16 @@ export function renderNeighborhood(containerId, options = {}) {
       group.add(highlight);
       group.userData.viewerHighlight = highlight;
     }
+
+    // Add conversation indicator (hidden by default)
+    const conversationIndicator = createConversationIndicator();
+    group.add(conversationIndicator);
+    group.userData.conversationIndicator = conversationIndicator;
+
+    // Add message notification indicator (hidden by default)
+    const messageIndicator = createMessageIndicator();
+    group.add(messageIndicator);
+    group.userData.messageIndicator = messageIndicator;
 
     // Position
     const pos = user.position || { x: random() * 20 - 10, z: random() * 20 - 10 };
@@ -852,6 +1058,83 @@ export function renderNeighborhood(containerId, options = {}) {
       if (figure.userData.sellerBadge) {
         figure.userData.sellerBadge.position.y = 2.8 + Math.sin(time * 2) * 0.1;
         figure.userData.sellerBadge.rotation.y = time;
+      }
+
+      // Animate conversation indicator
+      if (figure.userData.conversationIndicator && figure.userData.conversationIndicator.visible) {
+        const indicator = figure.userData.conversationIndicator;
+
+        // Gentle bobbing
+        indicator.position.y = Math.sin(time * 1.5) * 0.05;
+
+        // Animate typing dots if typing
+        if (indicator.userData.isTyping) {
+          indicator.children.forEach(child => {
+            if (child.userData && child.userData.dotIndex !== undefined) {
+              const dotTime = time * 4 + child.userData.dotIndex * 0.5;
+              child.position.y = 2.5 + Math.sin(dotTime) * 0.05;
+              child.material.opacity = 0.5 + Math.sin(dotTime) * 0.5;
+            }
+          });
+        }
+      }
+
+      // Animate message indicator (pulsing)
+      if (figure.userData.messageIndicator && figure.userData.messageIndicator.visible) {
+        const indicator = figure.userData.messageIndicator;
+        const pulse = 0.7 + Math.sin(time * 4) * 0.3;
+        const scale = 0.9 + Math.sin(time * 3) * 0.2;
+
+        indicator.children.forEach(child => {
+          if (child.material && child.material.color) {
+            // Pulse the red circle
+            if (child.material.color.getHex() === 0xff4444) {
+              child.material.opacity = pulse;
+            }
+          }
+        });
+        indicator.scale.set(scale, scale, 1);
+      }
+
+      // Animate appear effect (scale up)
+      if (figure.userData.appearAnimation) {
+        const anim = figure.userData.appearAnimation;
+        const elapsed = performance.now() - anim.startTime;
+        const progress = Math.min(elapsed / anim.duration, 1);
+
+        // Ease out elastic for bouncy appear
+        const eased = 1 - Math.pow(1 - progress, 3);
+        figure.scale.set(eased, eased, eased);
+
+        if (progress >= 1) {
+          figure.scale.set(1, 1, 1);
+          delete figure.userData.appearAnimation;
+        }
+      }
+
+      // Animate disappear effect (scale down + fade)
+      if (figure.userData.disappearAnimation) {
+        const anim = figure.userData.disappearAnimation;
+        const elapsed = performance.now() - anim.startTime;
+        const progress = Math.min(elapsed / anim.duration, 1);
+
+        // Scale down and move up (beam out)
+        const scale = 1 - progress;
+        figure.scale.set(scale, 1 + progress * 2, scale);
+        figure.position.y = progress * 5;
+
+        // Fade out all materials
+        figure.traverse(child => {
+          if (child.material && child.material.opacity !== undefined) {
+            child.material.transparent = true;
+            child.material.opacity = 1 - progress;
+          }
+        });
+
+        if (progress >= 1) {
+          figure.visible = false;
+          delete figure.userData.disappearAnimation;
+        }
       }
     });
 
@@ -1074,8 +1357,8 @@ export function renderNeighborhood(containerId, options = {}) {
   }
 
   // Update a single user's position (called from LiveView)
-  function updateUserPosition(userId, position) {
-    console.log("[neighborhood] updateUserPosition:", userId, position);
+  function updateUserPosition(userId, position, teleport = false) {
+    console.log("[neighborhood] updateUserPosition:", userId, position, teleport ? "(teleport)" : "");
     entityPositions.set(userId, { x: position.x, z: position.z });
 
     // If we don't have a figure for this user yet, we'll create one
@@ -1098,6 +1381,57 @@ export function renderNeighborhood(containerId, options = {}) {
       const figure = createFigure(user, 0.4);
       figures.push(figure);
       scene.add(figure);
+    } else if (teleport) {
+      // For teleport (travel), immediately snap to position
+      existingFigure.position.x = position.x;
+      existingFigure.position.z = position.z;
+    }
+
+    // If this is the viewer and it's a teleport, pan camera to follow
+    if (existingFigure && existingFigure.userData.isViewer && teleport) {
+      cameraPanTarget = { x: position.x, z: position.z };
+    }
+  }
+
+  // Teleport all entities to new positions (used during travel)
+  function teleportEntities(entities) {
+    console.log("[neighborhood] teleportEntities:", entities.length, "entities");
+
+    entities.forEach(entity => {
+      entityPositions.set(entity.id, { x: entity.position.x, z: entity.position.z });
+
+      const figure = figures.find(f => f.userData.user?.id === entity.id);
+      if (figure) {
+        // Immediately snap to new position
+        figure.position.x = entity.position.x;
+        figure.position.z = entity.position.z;
+
+        // Pan to viewer
+        if (figure.userData.isViewer) {
+          cameraPanTarget = { x: entity.position.x, z: entity.position.z };
+        }
+      }
+    });
+  }
+
+  // Show user appearing animation (beam in effect)
+  function showUserAppear(userId) {
+    const figure = figures.find(f => f.userData.user?.id === userId);
+    if (figure) {
+      // Reset visibility and start appear animation
+      figure.visible = true;
+      figure.userData.appearAnimation = { startTime: performance.now(), duration: 1000 };
+      figure.scale.set(0.1, 0.1, 0.1);
+      console.log("[neighborhood] User appearing:", userId);
+    }
+  }
+
+  // Show user disappearing animation (beam out effect)
+  function showUserDisappear(userId) {
+    const figure = figures.find(f => f.userData.user?.id === userId);
+    if (figure) {
+      figure.userData.disappearAnimation = { startTime: performance.now(), duration: 800 };
+      console.log("[neighborhood] User disappearing:", userId);
     }
   }
 
@@ -1111,6 +1445,53 @@ export function renderNeighborhood(containerId, options = {}) {
   // Pan camera to a world position
   function panToPosition(x, z) {
     cameraPanTarget = { x, z };
+  }
+
+  // Set conversation state for a user
+  function setUserConversationState(userId, inConversation, isTyping = false) {
+    const figure = figures.find(f => f.userData.user?.id === userId);
+    if (figure && figure.userData.conversationIndicator) {
+      const indicator = figure.userData.conversationIndicator;
+      indicator.visible = inConversation || isTyping;
+      indicator.userData.inConversation = inConversation;
+      indicator.userData.isTyping = isTyping;
+
+      // Update dot visibility based on typing
+      indicator.children.forEach(child => {
+        if (child.userData && child.userData.dotIndex !== undefined) {
+          child.visible = isTyping;
+        }
+      });
+    }
+  }
+
+  // Set typing state for a user
+  function setUserTyping(userId, isTyping) {
+    const figure = figures.find(f => f.userData.user?.id === userId);
+    if (figure && figure.userData.conversationIndicator) {
+      const indicator = figure.userData.conversationIndicator;
+      indicator.userData.isTyping = isTyping;
+      if (isTyping) {
+        indicator.visible = true;
+      }
+
+      // Update dot visibility
+      indicator.children.forEach(child => {
+        if (child.userData && child.userData.dotIndex !== undefined) {
+          child.visible = isTyping;
+        }
+      });
+    }
+  }
+
+  // Set message notification indicator for a user
+  function setUserHasMessage(userId, hasMessage) {
+    const figure = figures.find(f => f.userData.user?.id === userId);
+    if (figure && figure.userData.messageIndicator) {
+      const indicator = figure.userData.messageIndicator;
+      indicator.visible = hasMessage;
+      indicator.userData.hasMessage = hasMessage;
+    }
   }
 
   // Return cleanup function and API for LiveView hook integration
@@ -1136,10 +1517,18 @@ export function renderNeighborhood(containerId, options = {}) {
     getViewerPosition: () => viewerFigure ? { x: viewerFigure.position.x, z: viewerFigure.position.z } : null,
     // New APIs for travel and objects
     updateLocation: updateLocation,
+    teleportEntities: teleportEntities,
     createBoundaryLines: createBoundaryLines,
     addWorldObject: addWorldObject,
     removeWorldObject: removeWorldObject,
     updateWorldObject: updateWorldObject,
-    setPlaceMode: setPlaceMode
+    setPlaceMode: setPlaceMode,
+    // Conversation indicators
+    setUserConversationState: setUserConversationState,
+    setUserTyping: setUserTyping,
+    setUserHasMessage: setUserHasMessage,
+    // Travel animations
+    showUserAppear: showUserAppear,
+    showUserDisappear: showUserDisappear
   };
 }
