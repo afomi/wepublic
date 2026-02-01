@@ -39,6 +39,11 @@ defmodule Wepublic.Accounts.User do
     field :public_key, :binary
     field :did_key, :string
 
+    # Global position (lat/long)
+    field :position_lat, :float
+    field :position_long, :float
+    belongs_to :last_location, Wepublic.Geo.Location
+
     timestamps(type: :utc_datetime)
   end
 

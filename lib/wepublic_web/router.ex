@@ -20,8 +20,11 @@ defmodule WepublicWeb.Router do
   scope "/", WepublicWeb do
     pipe_through :browser
 
-    live "/", MapLive, :index
-    live "/map", MapLive, :index
+    live_session :default, on_mount: [{WepublicWeb.UserAuth, :mount_current_scope}] do
+      live "/", MapLive, :index
+      live "/map", MapLive, :index
+    end
+
     get "/home", PageController, :home
   end
 

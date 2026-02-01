@@ -5,10 +5,13 @@ defmodule WepublicWeb.MapLive do
   alias Wepublic.Accounts
   alias Wepublic.Accounts.User
   alias Wepublic.MapWorld
+  alias Wepublic.Geo
 
   @impl true
   def mount(_params, _session, socket) do
+    require Logger
     current_user = get_current_user(socket)
+    Logger.warning("MOUNT: current_user=#{inspect(current_user && current_user.email)}, assigns_keys=#{inspect(Map.keys(socket.assigns))}")
 
     # Generate a consistent user_id for this session
     my_user_id = get_my_user_id(current_user)
@@ -34,6 +37,10 @@ defmodule WepublicWeb.MapLive do
 
     online_users = Presence.list_users("map")
 
+    # Get current location from MapWorld
+    current_location = MapWorld.get_current_location()
+    world_objects = if connected?(socket), do: MapWorld.get_objects(), else: []
+
     socket =
       socket
       |> assign(:online_count, Presence.count("map"))
@@ -47,6 +54,14 @@ defmodule WepublicWeb.MapLive do
       |> assign(:my_user_id, my_user_id)
       |> assign(:world_entities, world_entities)
       |> assign(:show_onboarding_prompt, should_show_onboarding?(current_user))
+      |> assign(:current_location, current_location)
+      |> assign(:world_objects, world_objects)
+      |> assign(:show_travel_modal, false)
+      |> assign(:travel_search, "")
+      |> assign(:travel_results, [])
+      |> assign(:show_place_mode, false)
+      |> assign(:place_object_type, "pin")
+      |> assign(:place_object_color, "#4a90d9")
 
     {:ok, socket}
   end
@@ -80,7 +95,8 @@ defmodule WepublicWeb.MapLive do
 
   defp get_current_user(socket) do
     case socket.assigns do
-      %{current_scope: %{user: user}} -> user
+      %{current_scope: %Wepublic.Accounts.Scope{user: user}} when not is_nil(user) -> user
+      %{current_scope: %{user: user}} when not is_nil(user) -> user
       %{current_user: user} when not is_nil(user) -> user
       _ -> nil
     end
@@ -181,6 +197,41 @@ defmodule WepublicWeb.MapLive do
     {:noreply, push_event(socket, "user_position", %{user_id: user_id, position: position})}
   end
 
+  # Handle location change from MapWorld (when someone travels)
+  def handle_info({:location_changed, location, objects}, socket) do
+    require Logger
+    Logger.warning("LOCATION_CHANGED: #{location.name}")
+
+    {:noreply,
+     socket
+     |> assign(:current_location, location)
+     |> assign(:world_objects, objects)
+     |> push_event("location_changed", %{
+       location: serialize_location(location),
+       objects: Enum.map(objects, &serialize_object/1)
+     })}
+  end
+
+  # Handle object placement
+  def handle_info({:object_placed, object}, socket) do
+    {:noreply,
+     socket
+     |> update(:world_objects, &[object | &1])
+     |> push_event("object_placed", %{object: serialize_object(object)})}
+  end
+
+  # Handle object update
+  def handle_info({:object_updated, object}, socket) do
+    {:noreply,
+     socket
+     |> update(:world_objects, fn objects ->
+       Enum.map(objects, fn o ->
+         if o.id == object.parent_id || o.id == object.id, do: object, else: o
+       end)
+     end)
+     |> push_event("object_updated", %{object: serialize_object(object)})}
+  end
+
   @impl true
   def handle_event("toggle_drawer", _, socket) do
     {:noreply, assign(socket, :drawer_open, not socket.assigns.drawer_open)}
@@ -234,6 +285,110 @@ defmodule WepublicWeb.MapLive do
 
   def handle_event("dismiss_onboarding", _, socket) do
     {:noreply, assign(socket, :show_onboarding_prompt, false)}
+  end
+
+  # Travel modal
+  def handle_event("open_travel_modal", _, socket) do
+    {:noreply,
+     socket
+     |> assign(:show_travel_modal, true)
+     |> assign(:travel_search, "")
+     |> assign(:travel_results, Geo.list_locations())}
+  end
+
+  def handle_event("close_travel_modal", _, socket) do
+    {:noreply, assign(socket, :show_travel_modal, false)}
+  end
+
+  def handle_event("search_locations", %{"query" => query}, socket) do
+    results = if String.trim(query) == "" do
+      Geo.list_locations()
+    else
+      Geo.search_locations(query)
+    end
+
+    {:noreply,
+     socket
+     |> assign(:travel_search, query)
+     |> assign(:travel_results, results)}
+  end
+
+  def handle_event("travel_to", %{"location_id" => location_id}, socket) do
+    location_id = String.to_integer(location_id)
+
+    case MapWorld.travel(socket.assigns.my_user_id, location_id) do
+      {:ok, location} ->
+        {:noreply,
+         socket
+         |> assign(:show_travel_modal, false)
+         |> assign(:current_location, location)
+         |> put_flash(:info, "Traveled to #{location.name}")}
+
+      {:error, _reason} ->
+        {:noreply, put_flash(socket, :error, "Could not travel to that location")}
+    end
+  end
+
+  # Object placement
+  def handle_event("toggle_place_mode", _, socket) do
+    new_mode = not socket.assigns.show_place_mode
+    {:noreply,
+     socket
+     |> assign(:show_place_mode, new_mode)
+     |> push_event("set_place_mode", %{enabled: new_mode})}
+  end
+
+  def handle_event("set_object_type", %{"type" => type}, socket) do
+    {:noreply, assign(socket, :place_object_type, type)}
+  end
+
+  def handle_event("set_object_color", %{"color" => color}, socket) do
+    {:noreply, assign(socket, :place_object_color, color)}
+  end
+
+  def handle_event("place_object", %{"x" => x, "z" => z}, socket) do
+    attrs = %{
+      object_type: socket.assigns.place_object_type,
+      position_x: x,
+      position_z: z,
+      color: socket.assigns.place_object_color
+    }
+
+    case MapWorld.place_object(socket.assigns.my_user_id, attrs) do
+      {:ok, _object} ->
+        {:noreply, socket}
+
+      {:error, _reason} ->
+        {:noreply, put_flash(socket, :error, "Could not place object")}
+    end
+  end
+
+  def handle_event("pan_to_user", %{"user_id" => user_id}, socket) do
+    # Convert numeric id to the format used in MapWorld
+    map_user_id = "user_#{user_id}"
+
+    case MapWorld.get_entity(map_user_id) do
+      nil ->
+        {:noreply, put_flash(socket, :info, "User is not currently on the map")}
+
+      entity ->
+        {:noreply,
+         socket
+         |> assign(:drawer_open, false)
+         |> push_event("pan_to_position", %{x: entity.position.x, z: entity.position.z})}
+    end
+  end
+
+  def handle_event("recenter", _, socket) do
+    my_user_id = socket.assigns.my_user_id
+
+    case MapWorld.get_entity(my_user_id) do
+      nil ->
+        {:noreply, socket}
+
+      entity ->
+        {:noreply, push_event(socket, "pan_to_position", %{x: entity.position.x, z: entity.position.z})}
+    end
   end
 
   # Handle movement from the viewer - send to MapWorld
@@ -388,6 +543,33 @@ defmodule WepublicWeb.MapLive do
     |> Jason.encode!()
   end
 
+  defp serialize_location(nil), do: nil
+  defp serialize_location(location) do
+    %{
+      id: location.id,
+      name: location.name,
+      slug: location.slug,
+      center_lat: location.center_lat,
+      center_long: location.center_long,
+      bounds_geojson: location.bounds_geojson,
+      location_type: location.location_type
+    }
+  end
+
+  defp serialize_object(object) do
+    %{
+      id: object.id,
+      object_type: object.object_type,
+      position_x: object.position_x,
+      position_y: object.position_y,
+      position_z: object.position_z,
+      label: object.label,
+      color: object.color,
+      model_url: object.model_url,
+      version: object.version
+    }
+  end
+
   @impl true
   def render(assigns) do
     connections = assigns[:connections] || []
@@ -414,15 +596,21 @@ defmodule WepublicWeb.MapLive do
       class="fixed top-12 left-2.5 z-40 text-white font-mono text-xs bg-black/70 p-3 rounded-lg max-w-60"
     >
       <div class="text-sm font-bold mb-2">
-        Vacaville, CA
+        {location_name(@current_location)}
       </div>
       <div class="text-gray-400 mb-3">
-        38.3566°N, 121.9877°W
+        {location_coords(@current_location)}
       </div>
       <div class="flex items-center gap-2 mb-3 text-green-400">
         <span class="w-2 h-2 rounded-full bg-green-400 animate-pulse"></span>
         <span>{@online_count} online</span>
       </div>
+      <button
+        phx-click="open_travel_modal"
+        class="w-full text-left text-purple-400 hover:text-purple-300 text-xs py-1 mb-1"
+      >
+        Travel to another location →
+      </button>
       <button
         phx-click="toggle_drawer"
         class="w-full text-left text-blue-400 hover:text-blue-300 text-xs py-1"
@@ -435,6 +623,26 @@ defmodule WepublicWeb.MapLive do
       >
       </div>
     </div>
+
+    <button
+      phx-click="recenter"
+      title="Recenter on me"
+      class="fixed bottom-4 left-4 z-40 bg-black/70 hover:bg-black/90 text-white p-3 rounded-full shadow-lg transition"
+    >
+      <svg
+        class="w-5 h-5"
+        fill="none"
+        stroke="currentColor"
+        viewBox="0 0 24 24"
+      >
+        <path
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          stroke-width="2"
+          d="M12 8c-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4-1.79-4-4-4zm0-6v2m0 16v2m8-10h2M2 12h2m13.66-5.66l1.41-1.41M4.93 19.07l1.41-1.41m0-11.32L4.93 4.93m14.14 14.14l-1.41-1.41"
+        />
+      </svg>
+    </button>
 
     <.onboarding_prompt :if={@show_onboarding_prompt} />
 
@@ -450,7 +658,53 @@ defmodule WepublicWeb.MapLive do
       current_user={@current_user}
       connections={@connections}
     />
+
+    <.travel_modal
+      :if={@show_travel_modal}
+      results={@travel_results}
+      search={@travel_search}
+      current_location={@current_location}
+    />
+
+    <.place_controls
+      :if={@show_place_mode}
+      object_type={@place_object_type}
+      color={@place_object_color}
+    />
+
+    <button
+      phx-click="toggle_place_mode"
+      title={if @show_place_mode, do: "Exit place mode", else: "Place an object"}
+      class={[
+        "fixed bottom-4 left-16 z-40 p-3 rounded-full shadow-lg transition",
+        if(@show_place_mode, do: "bg-green-600 hover:bg-green-700 text-white", else: "bg-black/70 hover:bg-black/90 text-white")
+      ]}
+    >
+      <svg
+        class="w-5 h-5"
+        fill="none"
+        stroke="currentColor"
+        viewBox="0 0 24 24"
+      >
+        <path
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          stroke-width="2"
+          d="M12 4v16m8-8H4"
+        />
+      </svg>
+    </button>
     """
+  end
+
+  defp location_name(nil), do: "Unknown Location"
+  defp location_name(location), do: location.name
+
+  defp location_coords(nil), do: ""
+  defp location_coords(location) do
+    lat_dir = if location.center_lat >= 0, do: "N", else: "S"
+    long_dir = if location.center_long >= 0, do: "E", else: "W"
+    "#{abs(location.center_lat) |> Float.round(4)}°#{lat_dir}, #{abs(location.center_long) |> Float.round(4)}°#{long_dir}"
   end
 
   defp onboarding_prompt(assigns) do
@@ -532,7 +786,11 @@ defmodule WepublicWeb.MapLive do
 
   defp connection_item(assigns) do
     ~H"""
-    <div class="p-4 hover:bg-gray-800 cursor-pointer">
+    <div
+      class="p-4 hover:bg-gray-800 cursor-pointer"
+      phx-click={@conn.online && "pan_to_user"}
+      phx-value-user_id={@conn.id}
+    >
       <div class="flex items-center gap-3">
         <div class="relative">
           <div
@@ -561,6 +819,7 @@ defmodule WepublicWeb.MapLive do
         <div class="text-xs">
           <%= if @conn.online do %>
             <span class="text-green-400">online</span>
+            <span class="text-gray-600 ml-1">→</span>
           <% else %>
             <span class="text-gray-500">offline</span>
           <% end %>
@@ -788,6 +1047,143 @@ defmodule WepublicWeb.MapLive do
       ]}>
       </div>
       <span class="text-white text-sm ml-1">{@level}/2</span>
+    </div>
+    """
+  end
+
+  defp travel_modal(assigns) do
+    ~H"""
+    <div
+      class="fixed inset-0 z-50 flex items-center justify-center p-4"
+      phx-window-keydown="close_travel_modal"
+      phx-key="Escape"
+    >
+      <div
+        class="absolute inset-0 bg-black/60"
+        phx-click="close_travel_modal"
+      >
+      </div>
+
+      <div class="relative bg-gray-800 rounded-xl shadow-2xl max-w-md w-full overflow-hidden">
+        <div class="p-4 border-b border-gray-700">
+          <div class="flex items-center justify-between">
+            <h2 class="text-white font-bold text-lg">Travel to Location</h2>
+            <button
+              phx-click="close_travel_modal"
+              class="text-gray-400 hover:text-white"
+            >
+              <svg
+                class="w-6 h-6"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  stroke-width="2"
+                  d="M6 18L18 6M6 6l12 12"
+                />
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="p-4">
+          <input
+            type="text"
+            value={@search}
+            phx-keyup="search_locations"
+            phx-debounce="300"
+            placeholder="Search locations..."
+            class="w-full bg-gray-700 text-white rounded-lg px-4 py-2 mb-4 focus:outline-none focus:ring-2 focus:ring-purple-500"
+          />
+
+          <div class="max-h-64 overflow-y-auto space-y-2">
+            <%= for location <- @results do %>
+              <button
+                phx-click="travel_to"
+                phx-value-location_id={location.id}
+                disabled={@current_location && @current_location.id == location.id}
+                class={[
+                  "w-full text-left p-3 rounded-lg transition",
+                  if(@current_location && @current_location.id == location.id,
+                    do: "bg-gray-600 text-gray-400 cursor-not-allowed",
+                    else: "bg-gray-700 hover:bg-gray-600 text-white"
+                  )
+                ]}
+              >
+                <div class="font-medium">{location.name}</div>
+                <div class="text-xs text-gray-400">
+                  {Float.round(location.center_lat, 4)}°, {Float.round(location.center_long, 4)}°
+                  <%= if @current_location && @current_location.id == location.id do %>
+                    <span class="text-purple-400 ml-2">(current)</span>
+                  <% end %>
+                </div>
+              </button>
+            <% end %>
+          </div>
+
+          <%= if @results == [] do %>
+            <div class="text-center text-gray-400 py-8">
+              No locations found
+            </div>
+          <% end %>
+        </div>
+      </div>
+    </div>
+    """
+  end
+
+  defp place_controls(assigns) do
+    ~H"""
+    <div class="fixed bottom-20 left-4 z-40 bg-black/80 rounded-lg p-3 text-white text-sm">
+      <div class="mb-2 font-medium">Place Object</div>
+
+      <div class="flex gap-2 mb-3">
+        <button
+          phx-click="set_object_type"
+          phx-value-type="pin"
+          class={[
+            "px-3 py-1 rounded",
+            if(@object_type == "pin", do: "bg-purple-600", else: "bg-gray-700 hover:bg-gray-600")
+          ]}
+        >
+          Pin
+        </button>
+        <button
+          phx-click="set_object_type"
+          phx-value-type="cube"
+          class={[
+            "px-3 py-1 rounded",
+            if(@object_type == "cube", do: "bg-purple-600", else: "bg-gray-700 hover:bg-gray-600")
+          ]}
+        >
+          Cube
+        </button>
+      </div>
+
+      <div class="flex items-center gap-2">
+        <span class="text-gray-400">Color:</span>
+        <div class="flex gap-1">
+          <%= for color <- ~w(#4a90d9 #d94a8a #8ad94a #d9a84a #9a4ad9 #ffffff) do %>
+            <button
+              phx-click="set_object_color"
+              phx-value-color={color}
+              class={[
+                "w-6 h-6 rounded",
+                if(@color == color, do: "ring-2 ring-white ring-offset-1 ring-offset-gray-800", else: "")
+              ]}
+              style={"background-color: #{color}"}
+            >
+            </button>
+          <% end %>
+        </div>
+      </div>
+
+      <div class="mt-3 text-xs text-gray-400">
+        Click on the ground to place
+      </div>
     </div>
     """
   end

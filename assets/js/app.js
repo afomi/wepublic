@@ -51,6 +51,45 @@ const Neighborhood = {
         this.updateUserPosition(user_id, position)
       }
     })
+
+    // Listen for pan-to-position requests (e.g., clicking a connection)
+    this.handleEvent("pan_to_position", ({ x, z }) => {
+      if (this.panToPosition) {
+        this.panToPosition(x, z)
+      }
+    })
+
+    // Listen for location changes (travel)
+    this.handleEvent("location_changed", ({ location, objects }) => {
+      if (this.updateLocation) {
+        this.updateLocation(location)
+      }
+      // Clear and re-add all objects for new location
+      if (objects && this.addWorldObject) {
+        objects.forEach(obj => this.addWorldObject(obj))
+      }
+    })
+
+    // Listen for object placement
+    this.handleEvent("object_placed", ({ object }) => {
+      if (this.addWorldObject) {
+        this.addWorldObject(object)
+      }
+    })
+
+    // Listen for object updates
+    this.handleEvent("object_updated", ({ object }) => {
+      if (this.updateWorldObject) {
+        this.updateWorldObject(object)
+      }
+    })
+
+    // Listen for place mode toggle
+    this.handleEvent("set_place_mode", ({ enabled }) => {
+      if (this.setPlaceMode) {
+        this.setPlaceMode(enabled)
+      }
+    })
   },
 
   initScene() {
@@ -69,6 +108,10 @@ const Neighborhood = {
       onMoveTo: (x, z) => {
         // Send click-to-move intent to server
         this.pushEvent("move_to", { x: x, z: z })
+      },
+      onPlaceObject: (x, z) => {
+        // Send place object intent to server
+        this.pushEvent("place_object", { x: x, z: z })
       }
     }
 
@@ -78,6 +121,11 @@ const Neighborhood = {
       this.updateUsers = result.updateUsers
       this.updateEntities = result.updateEntities
       this.updateUserPosition = result.updateUserPosition
+      this.panToPosition = result.panToPosition
+      this.updateLocation = result.updateLocation
+      this.addWorldObject = result.addWorldObject
+      this.updateWorldObject = result.updateWorldObject
+      this.setPlaceMode = result.setPlaceMode
       this.sceneInitialized = true
     }
   },

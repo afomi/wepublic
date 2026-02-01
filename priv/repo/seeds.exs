@@ -12,6 +12,73 @@
 
 alias Wepublic.Repo
 alias Wepublic.Accounts.{User, UserConnection}
+alias Wepublic.Geo.Location
+
+# ============================================================================
+# Seed Locations
+# ============================================================================
+
+IO.puts("Seeding locations...")
+
+locations_data = [
+  %{
+    name: "Vacaville, CA",
+    slug: "vacaville-ca",
+    center_lat: 38.3566,
+    center_long: -121.9877,
+    location_type: "city"
+  },
+  %{
+    name: "San Francisco, CA",
+    slug: "san-francisco-ca",
+    center_lat: 37.7749,
+    center_long: -122.4194,
+    location_type: "city"
+  },
+  %{
+    name: "Vallejo, CA",
+    slug: "vallejo-ca",
+    center_lat: 38.1041,
+    center_long: -122.2566,
+    location_type: "city"
+  },
+  %{
+    name: "Oakland, CA",
+    slug: "oakland-ca",
+    center_lat: 37.8044,
+    center_long: -122.2712,
+    location_type: "city"
+  },
+  %{
+    name: "Sacramento, CA",
+    slug: "sacramento-ca",
+    center_lat: 38.5816,
+    center_long: -121.4944,
+    location_type: "city"
+  }
+]
+
+locations =
+  for location_data <- locations_data do
+    case Repo.get_by(Location, slug: location_data.slug) do
+      nil ->
+        %Location{}
+        |> Location.changeset(location_data)
+        |> Repo.insert!()
+
+      existing ->
+        existing
+    end
+  end
+
+IO.puts("Seeded #{length(locations)} locations:")
+for loc <- locations do
+  IO.puts("  - #{loc.name} (#{loc.center_lat}, #{loc.center_long})")
+end
+
+# ============================================================================
+# Seed Users
+# ============================================================================
 
 # Seed 20 users for the neighborhood
 # These users represent the initial population of the 3D space

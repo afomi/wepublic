@@ -60,18 +60,6 @@ defmodule WepublicWeb.Presence do
   end
 
   @doc """
-  Broadcasts a position update for a user to all subscribers.
-  This is a lightweight broadcast that doesn't require a full presence diff.
-  """
-  def broadcast_position(location, user_id, position) do
-    Phoenix.PubSub.broadcast(
-      Wepublic.PubSub,
-      "presence:#{location}",
-      {:position_update, %{user_id: user_id, position: position}}
-    )
-  end
-
-  @doc """
   Gets the count of users in a location.
   """
   def count(location) do

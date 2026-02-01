@@ -12,6 +12,8 @@ defmodule Wepublic.Application do
       Wepublic.Repo,
       {DNSCluster, query: Application.get_env(:wepublic, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Wepublic.PubSub},
+      # HTTP client for external API calls (OSM Overpass, etc.)
+      {Finch, name: Wepublic.Finch},
       # Presence tracking for online users
       WepublicWeb.Presence,
       # World state manager for map entities

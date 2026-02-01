@@ -238,6 +238,18 @@ export function renderNeighborhood(containerId, options = {}) {
   const users = config.users.length > 0 ? config.users : defaultUsers;
   const viewer = users.find(u => u.isViewer) || users[0];
 
+  // Boundary lines group
+  const boundaryGroup = new THREE.Group();
+  scene.add(boundaryGroup);
+
+  // World objects group
+  const worldObjectsGroup = new THREE.Group();
+  scene.add(worldObjectsGroup);
+  const worldObjectMeshes = new Map(); // id -> mesh
+
+  // Place mode state
+  let placeModeEnabled = false;
+
   // Determine visibility/opacity based on connections
   function getOpacity(viewerUser, subject) {
     if (!viewerUser) return 0.6;
@@ -390,6 +402,179 @@ export function renderNeighborhood(containerId, options = {}) {
 
     group.visible = false;
     return group;
+  }
+
+  // Create boundary lines from GeoJSON
+  function createBoundaryLines(geojson) {
+    // Clear existing boundaries
+    while (boundaryGroup.children.length > 0) {
+      boundaryGroup.remove(boundaryGroup.children[0]);
+    }
+
+    if (!geojson) return;
+
+    let data;
+    try {
+      data = typeof geojson === "string" ? JSON.parse(geojson) : geojson;
+    } catch (e) {
+      console.error("Failed to parse boundary GeoJSON:", e);
+      return;
+    }
+
+    const features = data.features || [];
+    const lineMaterial = new THREE.LineBasicMaterial({
+      color: 0x9966ff,
+      linewidth: 2,
+      transparent: true,
+      opacity: 0.7
+    });
+
+    features.forEach(feature => {
+      const geometry = feature.geometry;
+      if (!geometry) return;
+
+      const coords = geometry.type === "Polygon"
+        ? geometry.coordinates[0]
+        : geometry.type === "LineString"
+          ? geometry.coordinates
+          : [];
+
+      if (coords.length < 2) return;
+
+      // Convert lat/long to local coordinates (simplified - assumes small area)
+      // Center of our coordinate system is origin (0, 0)
+      // For now, scale by a factor to make boundaries visible
+      const scale = 1000; // meters per degree (approximate)
+      const centerLat = origin.lat;
+      const centerLong = origin.long;
+
+      const points = coords.map(([lon, lat]) => {
+        const x = (lon - centerLong) * scale;
+        const z = -(lat - centerLat) * scale; // Negative because Z is south
+        return new THREE.Vector3(x, 0.1, z);
+      });
+
+      const lineGeometry = new THREE.BufferGeometry().setFromPoints(points);
+      const line = new THREE.Line(lineGeometry, lineMaterial);
+      boundaryGroup.add(line);
+    });
+  }
+
+  // Create a world object mesh
+  function createWorldObject(obj) {
+    const group = new THREE.Group();
+    const color = parseColor(obj.color || "#4a90d9");
+
+    const material = new THREE.MeshStandardMaterial({
+      color: color,
+      roughness: 0.5,
+      metalness: 0.2
+    });
+
+    let mesh;
+    switch (obj.object_type) {
+      case "pin":
+        // Pin: tall thin cylinder with sphere on top
+        const pinBody = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.05, 0.05, 1.5, 8),
+          material
+        );
+        pinBody.position.y = 0.75;
+        pinBody.castShadow = true;
+        group.add(pinBody);
+
+        const pinHead = new THREE.Mesh(
+          new THREE.SphereGeometry(0.2, 16, 16),
+          material
+        );
+        pinHead.position.y = 1.6;
+        pinHead.castShadow = true;
+        group.add(pinHead);
+        break;
+
+      case "cube":
+        mesh = new THREE.Mesh(
+          new THREE.BoxGeometry(0.8, 0.8, 0.8),
+          material
+        );
+        mesh.position.y = 0.4;
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        group.add(mesh);
+        break;
+
+      case "model":
+        // Placeholder for custom models - use a cone for now
+        mesh = new THREE.Mesh(
+          new THREE.ConeGeometry(0.4, 1.2, 8),
+          material
+        );
+        mesh.position.y = 0.6;
+        mesh.castShadow = true;
+        group.add(mesh);
+        break;
+
+      default:
+        // Default sphere
+        mesh = new THREE.Mesh(
+          new THREE.SphereGeometry(0.3, 16, 16),
+          material
+        );
+        mesh.position.y = 0.3;
+        mesh.castShadow = true;
+        group.add(mesh);
+    }
+
+    // Add label if present
+    if (obj.label) {
+      // Labels would need a sprite or CSS2DObject - skipping for now
+    }
+
+    group.position.set(obj.position_x, obj.position_y || 0, obj.position_z);
+    group.userData = { object: obj };
+
+    return group;
+  }
+
+  // Add a world object to the scene
+  function addWorldObject(obj) {
+    const mesh = createWorldObject(obj);
+    worldObjectsGroup.add(mesh);
+    worldObjectMeshes.set(obj.id, mesh);
+  }
+
+  // Remove a world object from the scene
+  function removeWorldObject(id) {
+    const mesh = worldObjectMeshes.get(id);
+    if (mesh) {
+      worldObjectsGroup.remove(mesh);
+      worldObjectMeshes.delete(id);
+    }
+  }
+
+  // Update a world object
+  function updateWorldObject(obj) {
+    removeWorldObject(obj.parent_id || obj.id);
+    addWorldObject(obj);
+  }
+
+  // Update location (new location data with boundary)
+  function updateLocation(locationData) {
+    if (locationData.bounds_geojson) {
+      createBoundaryLines(locationData.bounds_geojson);
+    }
+
+    // Update origin for coordinate conversion
+    if (locationData.center_lat && locationData.center_long) {
+      origin.lat = locationData.center_lat;
+      origin.long = locationData.center_long;
+    }
+  }
+
+  // Set place mode
+  function setPlaceMode(enabled) {
+    placeModeEnabled = enabled;
+    renderer.domElement.style.cursor = enabled ? "crosshair" : "pointer";
   }
 
   // Create figure (simple human shape)
@@ -568,6 +753,10 @@ export function renderNeighborhood(containerId, options = {}) {
   let animationId = null;
   let lastTime = performance.now();
 
+  // Camera panning state
+  let cameraPanTarget = null;
+  const cameraOffset = { x: camDistance, y: camDistance, z: camDistance };
+
   function animate() {
     animationId = requestAnimationFrame(animate);
 
@@ -576,6 +765,27 @@ export function renderNeighborhood(containerId, options = {}) {
     lastTime = now;
 
     time += delta;
+
+    // Handle camera panning
+    if (cameraPanTarget) {
+      const targetCamX = cameraPanTarget.x + cameraOffset.x;
+      const targetCamZ = cameraPanTarget.z + cameraOffset.z;
+
+      const panSpeed = 5 * delta;
+      const dx = targetCamX - camera.position.x;
+      const dz = targetCamZ - camera.position.z;
+      const dist = Math.sqrt(dx * dx + dz * dz);
+
+      if (dist > 0.5) {
+        const ratio = Math.min(panSpeed / dist, 1);
+        camera.position.x += dx * ratio;
+        camera.position.z += dz * ratio;
+        camera.lookAt(cameraPanTarget.x, 0, cameraPanTarget.z);
+      } else {
+        // Arrived at target
+        cameraPanTarget = null;
+      }
+    }
 
     // Send movement intents to server (throttled)
     if (now - lastMoveIntent > MOVE_INTENT_INTERVAL && config.onMove) {
@@ -752,11 +962,18 @@ export function renderNeighborhood(containerId, options = {}) {
     for (const intersect of intersects) {
       let obj = intersect.object;
 
-      // Check if clicked on ground for movement
+      // Check if clicked on ground
       while (obj) {
         if (obj.userData.isGround) {
-          // Send move-to intent to server
           const point = intersect.point;
+
+          // If in place mode, place an object instead of moving
+          if (placeModeEnabled && config.onPlaceObject) {
+            config.onPlaceObject(point.x, point.z);
+            return;
+          }
+
+          // Send move-to intent to server
           if (config.onMoveTo) {
             config.onMoveTo(point.x, point.z);
           }
@@ -891,6 +1108,11 @@ export function renderNeighborhood(containerId, options = {}) {
     }
   });
 
+  // Pan camera to a world position
+  function panToPosition(x, z) {
+    cameraPanTarget = { x, z };
+  }
+
   // Return cleanup function and API for LiveView hook integration
   return {
     cleanup: function() {
@@ -910,6 +1132,14 @@ export function renderNeighborhood(containerId, options = {}) {
     updateUsers: updateUsers,
     updateEntities: updateEntities,
     updateUserPosition: updateUserPosition,
-    getViewerPosition: () => viewerFigure ? { x: viewerFigure.position.x, z: viewerFigure.position.z } : null
+    panToPosition: panToPosition,
+    getViewerPosition: () => viewerFigure ? { x: viewerFigure.position.x, z: viewerFigure.position.z } : null,
+    // New APIs for travel and objects
+    updateLocation: updateLocation,
+    createBoundaryLines: createBoundaryLines,
+    addWorldObject: addWorldObject,
+    removeWorldObject: removeWorldObject,
+    updateWorldObject: updateWorldObject,
+    setPlaceMode: setPlaceMode
   };
 }

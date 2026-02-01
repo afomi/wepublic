@@ -6,6 +6,8 @@ defmodule Wepublic.MapWorld do
   - Track all entity positions (users, NPCs, beacons)
   - Assign spawn positions for new users
   - Process movement intents
+  - Handle travel between locations
+  - Manage world objects
   - Broadcast state updates to subscribers
 
   Clients send intents, server owns state.
@@ -14,11 +16,12 @@ defmodule Wepublic.MapWorld do
   use GenServer
 
   alias Phoenix.PubSub
+  alias Wepublic.Geo
 
   @pubsub Wepublic.PubSub
   @topic "map_world"
 
-  # Spawn positions spread around the map
+  # Spawn positions spread around the map (local coordinates)
   @spawn_positions [
     {0, 0},
     {5, 5},
@@ -41,10 +44,18 @@ defmodule Wepublic.MapWorld do
   # Tick interval for processing movement
   @tick_interval 50
 
+  # Default location (Vacaville, CA)
+  @default_location_slug "vacaville-ca"
+
+  # Visibility radius in meters
+  @visibility_radius 100.0
+
   # State structure
   defstruct entities: %{},
             spawn_index: 0,
-            movement_targets: %{}
+            movement_targets: %{},
+            world_objects: %{},
+            current_location: nil
 
   ## Client API
 
@@ -101,10 +112,56 @@ defmodule Wepublic.MapWorld do
     PubSub.unsubscribe(@pubsub, @topic)
   end
 
+  @doc """
+  Travel to a location. Teleports the user to the location's center.
+  Returns {:ok, location} on success.
+  """
+  def travel(user_id, location_id) do
+    GenServer.call(__MODULE__, {:travel, user_id, location_id})
+  end
+
+  @doc """
+  Get the current location for the world.
+  """
+  def get_current_location do
+    GenServer.call(__MODULE__, :get_current_location)
+  end
+
+  @doc """
+  Get entities near a position within the visibility radius.
+  """
+  def get_nearby_entities(x, z, radius \\ @visibility_radius) do
+    GenServer.call(__MODULE__, {:get_nearby_entities, x, z, radius})
+  end
+
+  @doc """
+  Place a world object at the current location.
+  """
+  def place_object(user_id, attrs) do
+    GenServer.call(__MODULE__, {:place_object, user_id, attrs})
+  end
+
+  @doc """
+  Get all world objects at the current location.
+  """
+  def get_objects do
+    GenServer.call(__MODULE__, :get_objects)
+  end
+
+  @doc """
+  Update a world object (creates new version).
+  """
+  def update_object(object_id, attrs) do
+    GenServer.call(__MODULE__, {:update_object, object_id, attrs})
+  end
+
   ## Server Callbacks
 
   @impl true
   def init(_opts) do
+    # Load default location
+    current_location = Geo.get_location_by_slug(@default_location_slug)
+
     # Initialize with demo NPCs at fixed positions
     npcs = %{
       "npc_alice" => %{
@@ -139,10 +196,19 @@ defmodule Wepublic.MapWorld do
       }
     }
 
+    # Load world objects for the current location
+    world_objects = load_world_objects(current_location)
+
     # Start the movement tick
     schedule_tick()
 
-    {:ok, %__MODULE__{entities: npcs, spawn_index: 0, movement_targets: %{}}}
+    {:ok, %__MODULE__{
+      entities: npcs,
+      spawn_index: 0,
+      movement_targets: %{},
+      current_location: current_location,
+      world_objects: world_objects
+    }}
   end
 
   defp schedule_tick do
@@ -158,6 +224,7 @@ defmodule Wepublic.MapWorld do
       Logger.warning("JOIN: #{user_id} already exists")
       {:reply, {:ok, state.entities[user_id]}, state}
     else
+      Logger.warning("JOIN: #{user_id} with meta=#{inspect(meta)}")
       # Assign spawn position
       {spawn_x, spawn_z} = Enum.at(@spawn_positions, rem(state.spawn_index, length(@spawn_positions)))
 
@@ -192,6 +259,133 @@ defmodule Wepublic.MapWorld do
   @impl true
   def handle_call({:get_entity, user_id}, _from, state) do
     {:reply, Map.get(state.entities, user_id), state}
+  end
+
+  @impl true
+  def handle_call(:get_current_location, _from, state) do
+    {:reply, state.current_location, state}
+  end
+
+  @impl true
+  def handle_call({:get_nearby_entities, x, z, radius}, _from, state) do
+    nearby = state.entities
+    |> Map.values()
+    |> Enum.filter(fn entity ->
+      dx = entity.position.x - x
+      dz = entity.position.z - z
+      :math.sqrt(dx * dx + dz * dz) <= radius
+    end)
+
+    {:reply, nearby, state}
+  end
+
+  @impl true
+  def handle_call({:travel, user_id, location_id}, _from, state) do
+    require Logger
+
+    case Geo.get_location(location_id) do
+      nil ->
+        {:reply, {:error, :location_not_found}, state}
+
+      location ->
+        Logger.warning("TRAVEL: #{user_id} traveling to #{location.name}")
+
+        # Update user's position to spawn at location center
+        case Map.get(state.entities, user_id) do
+          nil ->
+            {:reply, {:error, :user_not_found}, state}
+
+          entity ->
+            # Spawn at center (0, 0) of new location
+            {spawn_x, spawn_z} = {0.0, 0.0}
+            updated_entity = %{entity | position: %{x: spawn_x, z: spawn_z}}
+            new_entities = Map.put(state.entities, user_id, updated_entity)
+
+            # Load objects for new location
+            world_objects = load_world_objects(location)
+
+            new_state = %{state |
+              entities: new_entities,
+              current_location: location,
+              world_objects: world_objects,
+              movement_targets: Map.delete(state.movement_targets, user_id)
+            }
+
+            # Broadcast location change to all subscribers
+            broadcast_location_change(location, world_objects)
+            broadcast_update(new_entities)
+
+            {:reply, {:ok, location}, new_state}
+        end
+    end
+  end
+
+  @impl true
+  def handle_call({:place_object, user_id, attrs}, _from, state) do
+    require Logger
+
+    case state.current_location do
+      nil ->
+        {:reply, {:error, :no_location}, state}
+
+      location ->
+        # Extract user's numeric ID if possible
+        db_user_id = case user_id do
+          "user_" <> id -> String.to_integer(id)
+          _ -> nil
+        end
+
+        object_attrs = attrs
+        |> Map.put(:location_id, location.id)
+        |> Map.put(:user_id, db_user_id)
+
+        case Geo.create_object(object_attrs) do
+          {:ok, object} ->
+            Logger.warning("PLACE_OBJECT: #{user_id} placed #{object.object_type} at (#{object.position_x}, #{object.position_z})")
+
+            # Update in-memory world objects
+            new_objects = Map.put(state.world_objects, object.id, object)
+            new_state = %{state | world_objects: new_objects}
+
+            # Broadcast object placement
+            broadcast_object_placed(object)
+
+            {:reply, {:ok, object}, new_state}
+
+          {:error, changeset} ->
+            {:reply, {:error, changeset}, state}
+        end
+    end
+  end
+
+  @impl true
+  def handle_call(:get_objects, _from, state) do
+    {:reply, Map.values(state.world_objects), state}
+  end
+
+  @impl true
+  def handle_call({:update_object, object_id, attrs}, _from, state) do
+    case Map.get(state.world_objects, object_id) do
+      nil ->
+        {:reply, {:error, :object_not_found}, state}
+
+      object ->
+        case Geo.update_object(object, attrs) do
+          {:ok, new_object} ->
+            # Replace old version with new in memory
+            new_objects = state.world_objects
+            |> Map.delete(object_id)
+            |> Map.put(new_object.id, new_object)
+
+            new_state = %{state | world_objects: new_objects}
+            broadcast_object_updated(new_object)
+
+            {:reply, {:ok, new_object}, new_state}
+
+          {:error, changeset} ->
+            {:reply, {:error, changeset}, state}
+        end
+    end
   end
 
   @impl true
@@ -330,6 +524,26 @@ defmodule Wepublic.MapWorld do
 
   defp broadcast_position_update(user_id, position) do
     PubSub.broadcast(@pubsub, @topic, {:position_update, user_id, position})
+  end
+
+  defp broadcast_location_change(location, world_objects) do
+    PubSub.broadcast(@pubsub, @topic, {:location_changed, location, Map.values(world_objects)})
+  end
+
+  defp broadcast_object_placed(object) do
+    PubSub.broadcast(@pubsub, @topic, {:object_placed, object})
+  end
+
+  defp broadcast_object_updated(object) do
+    PubSub.broadcast(@pubsub, @topic, {:object_updated, object})
+  end
+
+  defp load_world_objects(nil), do: %{}
+  defp load_world_objects(location) do
+    location.id
+    |> Geo.list_objects_at_location()
+    |> Enum.map(fn obj -> {obj.id, obj} end)
+    |> Map.new()
   end
 
   defp random_color do
