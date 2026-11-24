@@ -66,7 +66,7 @@ defmodule Wepublic.MixProject do
       {:gettext, "~> 1.0"},
       {:jason, "~> 1.2"},
       {:b58, "~> 1.0"},
-      {:dns_cluster, "~> 0.2.0"},
+      {:dns_cluster, "~> 0.3.1"},
       {:bandit, "~> 1.5"},
       {:ueberauth, "~> 0.10"},
       {:ueberauth_github, "~> 0.8"},
